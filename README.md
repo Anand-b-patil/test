@@ -839,6 +839,213 @@ Since the metadata extension already carries `lineItem`, `identification`, `sele
 
 ---
 
+
+---
+
+# ZVX_01_SAMPLE_REPORT
+
+```abap
+REPORT zvx_01_sample_report.
+
+TYPE-POOLS: vrm.
+
+TABLES:
+  zvx_01_smpl_req,
+  kna1,
+  makt.
+
+*-----------------------------------------------------------------------
+* Selection Screen
+*-----------------------------------------------------------------------
+
+SELECT-OPTIONS:
+  s_kunnr FOR zvx_01_smpl_req-customer,
+  s_matnr FOR zvx_01_smpl_req-material,
+  s_date  FOR zvx_01_smpl_req-req_date.
+
+PARAMETERS:
+  p_stat TYPE char2 AS LISTBOX VISIBLE LENGTH 15.
+
+PARAMETERS:
+  p_half AS CHECKBOX.
+
+*-----------------------------------------------------------------------
+* Types
+*-----------------------------------------------------------------------
+
+TYPES: BEGIN OF ty_output,
+
+         request_no TYPE numc10,
+         customer   TYPE kunnr,
+         name1      TYPE kna1-name1,
+         material   TYPE matnr,
+         maktx      TYPE makt-maktx,
+         quantity   TYPE menge_d,
+         uom        TYPE meins,
+         req_date   TYPE dats,
+         req_status TYPE char2,
+
+       END OF ty_output.
+
+DATA:
+
+  gt_output TYPE STANDARD TABLE OF ty_output,
+  gs_output TYPE ty_output.
+
+*-----------------------------------------------------------------------
+* Status Dropdown
+*-----------------------------------------------------------------------
+
+INITIALIZATION.
+
+  PERFORM fill_status.
+
+FORM fill_status.
+
+  DATA:
+    lt_values TYPE vrm_values,
+    ls_value  TYPE vrm_value.
+
+  ls_value-key = ''.
+  ls_value-text = 'All'.
+  APPEND ls_value TO lt_values.
+
+  ls_value-key = '01'.
+  ls_value-text = 'Requested'.
+  APPEND ls_value TO lt_values.
+
+  ls_value-key = '02'.
+  ls_value-text = 'Approved'.
+  APPEND ls_value TO lt_values.
+
+  ls_value-key = '03'.
+  ls_value-text = 'Dispatched'.
+  APPEND ls_value TO lt_values.
+
+  ls_value-key = '04'.
+  ls_value-text = 'Rejected'.
+  APPEND ls_value TO lt_values.
+
+  CALL FUNCTION 'VRM_SET_VALUES'
+    EXPORTING
+      id     = 'P_STAT'
+      values = lt_values.
+
+ENDFORM.
+
+*-----------------------------------------------------------------------
+* Validation
+*-----------------------------------------------------------------------
+
+AT SELECTION-SCREEN.
+
+  IF s_date-high IS NOT INITIAL
+     AND s_date-high > sy-datum.
+
+    MESSAGE 'Future date is not allowed' TYPE 'E'.
+
+  ENDIF.
+
+*-----------------------------------------------------------------------
+* Start of Selection
+*-----------------------------------------------------------------------
+
+START-OF-SELECTION.
+
+  PERFORM get_data.
+
+  PERFORM display_alv.
+
+*-----------------------------------------------------------------------
+* Get Data
+*-----------------------------------------------------------------------
+
+FORM get_data.
+
+  SELECT
+
+      a~request_no,
+      a~customer,
+      b~name1,
+      a~material,
+      c~maktx,
+      a~quantity,
+      a~uom,
+      a~req_date,
+      a~req_status
+
+  INTO TABLE @gt_output
+
+  FROM zvx_01_smpl_req AS a
+
+  INNER JOIN kna1 AS b
+     ON a~customer = b~kunnr
+
+  INNER JOIN makt AS c
+     ON a~material = c~matnr
+
+  WHERE
+
+        a~customer IN @s_kunnr
+
+    AND a~material IN @s_matnr
+
+    AND a~req_date IN @s_date
+
+    AND c~spras = @sy-langu.
+
+  IF p_stat IS NOT INITIAL.
+
+    DELETE gt_output
+      WHERE req_status <> p_stat.
+
+  ENDIF.
+
+ENDFORM.
+
+*-----------------------------------------------------------------------
+* Display ALV
+*-----------------------------------------------------------------------
+
+FORM display_alv.
+
+  DATA:
+
+    lo_alv TYPE REF TO cl_salv_table.
+
+  cl_salv_table=>factory(
+
+      IMPORTING
+
+          r_salv_table = lo_alv
+
+      CHANGING
+
+          t_table = gt_output ).
+
+*-----------------------------------------------------------------------
+* Functions
+*-----------------------------------------------------------------------
+
+  lo_alv->get_functions( )->set_all( ).
+
+*-----------------------------------------------------------------------
+* Optimize Columns
+*-----------------------------------------------------------------------
+
+  lo_alv->get_columns( )->set_optimize( ).
+
+*-----------------------------------------------------------------------
+* Display
+*-----------------------------------------------------------------------
+
+  lo_alv->display( ).
+
+ENDFORM.
+```
+
+---
+
 ## How One Request Flows Through the Whole Stack
 
 1. User opens the Fiori app and hits **Create**.
