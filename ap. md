@@ -1,0 +1,1868 @@
+# Material Sample Dispatch Tracker — RAP Build
+
+Before we touch Step 1, one quick note: your details block still shows literal placeholders — `<MY_ROLL_NUMBER>` and `<MY_PACKAGE>`. I can't invent your actual roll number or the package your evaluator assigned you, so I'll proceed using clearly-marked placeholder values (`<ROLL>`, `ZSDT_SAMPLE_REQ` as object name base) that you must swap for your real values before you activate anything. Everything else in the requirement is unambiguous, so I'm not blocking on this — just flagging it per Rule 12.
+
+---
+
+## STEP 1 — Database Table
+
+### Why we create it
+This is the **persistence layer** of the entire RAP Business Object. Every CDS view, every behavior implementation, every OData request eventually reads from or writes to this single transparent table. In a Managed RAP scenario, the table's structure directly shapes:
+- What fields the CDS Root View can expose
+- What key strategy the Behavior Definition can use (UUID-based managed create)
+- What field can serve as the ETag for concurrency control
+
+Get this table wrong, and every downstream object (Steps 4–12) inherits the mistake.
+
+### Where it is used
+- Referenced as the **underlying entity** (`define root view entity ... as select from`) in the CDS Root View (Step 4)
+- Read/written exclusively through **RAP-generated database operations** inside the Behavior Implementation (Step 8) — never accessed directly via `INSERT`/`MODIFY` from outside the BO
+- Used by the Classic ALV report (Step 12) as one side of the `MAKT`/`KNA1` join
+
+### How RAP uses it
+RAP Managed scenario auto-generates all INSERT/UPDATE/DELETE database statements based on the structure of this table (via the CDS view on top of it). RAP relies on:
+- A **stable technical key** (UUID) to identify instances even before they're saved (early numbering)
+- An **ETag field** to detect concurrent modification conflicts
+- **Admin fields** (created/changed by & at) which RAP auto-populates during Save if annotated correctly in the CDS view
+
+### Common mistakes
+1. Using `REQUEST_NO` (a human-readable number) as the **primary/technical key** instead of `REQUEST_UUID` — this breaks RAP's managed early-numbering pattern and causes key-collision issues during parallel creates.
+2. Forgetting `NOT NULL` on key fields — activation error.
+3. Setting `dataMaintenance` to allow SM30 when the BO is meant to be the *only* entry point — creates a backdoor that bypasses all validations/determinations.
+4. Giving `QUANTITY` a type without matching decimal precision to `UOM` semantics — causes rounding/display issues in Fiori.
+5. Naming the table >16 characters — classic transparent tables still enforce this technical name limit even when created via the new ADT DDL-source editor.
+
+### Activation order
+This table has **zero dependencies** on any other object we build — it must be created and activated **first**, before the Message Class, before anything else. Nothing downstream can activate until this exists.
+
+---
+
+### Object Details
+
+| Item | Value |
+|---|---|
+| Object Type | Database Table (Transparent) |
+| Object Name | `ZSDT_SAMPLE_REQ` *(15 chars — replace prefix with your roll-number convention if your assessment requires it, but keep ≤16 chars total)* |
+| Package | `<MY_PACKAGE>` — replace with your assigned package |
+| Transport | Assigned automatically by ADT when you save (format `TRXXXXXXX`) — enter your assessment's actual transport |
+
+---
+
+### Complete Source Code
+
+Create via: **Eclipse ADT → Right-click package → New → Other ABAP Repository Object → Dictionary → Database Table**
+
+```abap
+@EndUserText.label : 'Material Sample Dispatch Request'
+@AbapCatalog.enhancement.category : #NOT_EXTENSIBLE
+@AbapCatalog.tableCategory : #TRANSPARENT
+@AbapCatalog.deliveryClass : #A
+@AbapCatalog.dataMaintenance : #RESTRICTED
+define table zsdt_sample_req {
+
+  key client                 : mandt not null;
+  key request_uuid            : sysuuid_x16 not null;
+  request_no                  : abap.char(10);
+  customer                    : kunnr;
+  material                    : matnr;
+  plant                       : werks_d;
+  quantity                    : abap.quan(13,3);
+  uom                         : meins;
+  req_date                    : dats;
+  req_status                  : abap.char(1);
+  reject_reason                : abap.char(100);
+  approved_by                  : syuname;
+  approved_on                  : dats;
+  created_by                   : syuname;
+  created_at                   : timestampl;
+  last_changed_by               : syuname;
+  last_changed_at               : timestampl;
+  local_last_changed_at          : timestampl;
+
+}
+```
+
+---
+
+### Field-by-Field Explanation
+
+| Field | Data Element / Type | Reasoning |
+|---|---|---|
+| `CLIENT` | `MANDT` | Mandatory first key field for every client-dependent table in SAP. |
+| `REQUEST_UUID` | `SYSUUID_X16` (RAW16) | **Technical primary key.** See "UUID" explanation below. |
+| `REQUEST_NO` | `CHAR10` | **Semantic/business key.** Human-readable request number (e.g. `SDR0000001`), generated in a Determination (Step 8) — never used as the DB key. |
+| `CUSTOMER` | `KUNNR` | Standard customer number data element — enables automatic value help & matches `I_Customer` association in Step 4. |
+| `MATERIAL` | `MATNR` | Standard material number data element (CHAR18, conversion exit `MATN1`) — matches `I_Product`. |
+| `PLANT` | `WERKS_D` | Standard plant data element — matches `I_Plant`. |
+| `QUANTITY` | `abap.quan(13,3)` | Built-in quantity type, 3 decimals — same precision as standard `MENGE`-based fields. No DDIC-level unit reference is set here (see "Currency/Quantity Reference" below — that's done at CDS level). |
+| `UOM` | `MEINS` | Standard unit-of-measure data element (CHAR3, conversion exit `CUNIT`). |
+| `REQ_DATE` | `DATS` | Date the sample request was raised. |
+| `REQ_STATUS` | `CHAR1` | Status code. Values used across this project: `N` = New, `V` = Validated, `A` = Approved, `R` = Rejected. This drives the `GET_STATUS_TEXT` utility method (Step 3) and the Criticality annotation (Step 4). |
+| `REJECT_REASON` | `CHAR100` | Free-text reason, populated only when status = `R`. |
+| `APPROVED_BY` | `SYUNAME` | User ID of the approver — set by the Approve action (Step 8), never editable by the end user directly. |
+| `APPROVED_ON` | `DATS` | Date of approval — set by the Approve action. |
+| `CREATED_BY` / `CREATED_AT` | `SYUNAME` / `TIMESTAMPL` | Standard RAP admin fields — auto-populated by the framework at create time when mapped via `@Semantics.systemDateTime.createdAt/createdBy` in Step 4. |
+| `LAST_CHANGED_BY` / `LAST_CHANGED_AT` | `SYUNAME` / `TIMESTAMPL` | Global last-change tracking — used for cross-system change propagation (delta pulls, side-effects). |
+| `LOCAL_LAST_CHANGED_AT` | `TIMESTAMPL` | **ETag field.** See explanation below — separate from the global field because ETag must reflect only *this system's* local change, not replicated changes from elsewhere. |
+
+---
+
+### Core DDIC Concepts Explained
+
+**Primary Key**
+The key is `CLIENT + REQUEST_UUID`. RAP Managed BOs are built around a technical key that the framework itself can generate client-side before the record even reaches the database — this is what makes "early numbering" work. `REQUEST_NO` deliberately sits *outside* the key; it's a separate business-facing identifier assigned during processing.
+
+**UUID**
+`REQUEST_UUID` (type `RAW16`, built via data element `SYSUUID_X16`) is generated by the RAP framework the instant a `CREATE` is triggered — even in a Fiori Elements draft, before Save is pressed. This lets the UI reference and navigate to an entity immediately, avoids number-range lock contention under concurrent creates, and guarantees global uniqueness without a database round-trip. Contrast this with `REQUEST_NO`, which is assigned later (in a determination) purely for human readability — approvers will search/filter by `REQUEST_NO`, not by UUID.
+
+**ETag**
+`LOCAL_LAST_CHANGED_AT` will be marked in the Behavior Definition (Step 7) as `etag master local_last_changed_at`. Every time a record is updated, RAP refreshes this timestamp. When a client sends an Update or the Approve/Reject action, it must supply the ETag value it last read; if another user changed the record in between, the values won't match and RAP rejects the request with **HTTP 412 Precondition Failed**. This is what prevents two managers from approving/rejecting the same request simultaneously with stale data.
+
+**Currency/Quantity Reference**
+`QUANTITY` is declared as the built-in type `abap.quan(13,3)` with **no DDIC-level reference to `UOM`** at the table level — this is intentional and is current SAP best practice. The semantic link between `QUANTITY` and `UOM` is established later, at the **CDS view level** (Step 4), using `@Semantics.quantity.unitOfMeasure: 'Uom'`. This is what drives correct decimal-place rendering and unit-aware conversions in Fiori Elements and ALV.
+
+**Technical Settings**
+Not expressible inline in the new DDL table source — after creating the table, open the **"Technical Settings"** tab of the table editor in ADT and set:
+- **Data Class**: `APPL1` (transaction data, since sample requests change frequently)
+- **Size Category**: `0` (start small; adjust after volume testing)
+- **Buffering**: `Not buffered` — mandatory for any table with frequent multi-user writes; buffering here would cause stale reads for the Approve/Reject workflow.
+
+**Delivery Class**
+`#A` = Application table (master/transaction data maintained by the customer application, not SAP-delivered Customizing). This is correct for a custom transactional table like this one — it tells the transport/upgrade system this table's *data* is customer-owned, not overwritten during SAP upgrades.
+
+**Enhancement Category**
+`#NOT_EXTENSIBLE` — this table isn't a component of an SAP standard structure meant for customer append/customizing includes, so there's no reason to allow enhancement. Setting this explicitly avoids the activation warning "Enhancement category needs to be maintained."
+
+---
+
+### Testing Steps
+1. Save and Activate (`Ctrl+F3`) in ADT.
+2. Open the table in **Data Preview** (F8 or right-click → Open With → Data Preview) — should show an empty result set with all 18 columns visible (17 fields + client).
+3. Check **Properties → Technical Settings** to confirm Data Class and Buffering were saved correctly.
+4. Optionally insert one test row via a throwaway ABAP report using `INSERT zsdt_sample_req` (only for structural testing — never do this in the final solution; RAP owns all writes from Step 8 onward).
+
+### Expected Output
+- Table activates with **no syntax errors**.
+- Visible in your package under Dictionary → Database Tables.
+- Data Preview shows 0 records, 18 columns, correct data types on hover (e.g. `MATERIAL` shows as `MATNR`, `QUANTITY` shows as `QUAN` with 3 decimals).
+
+### Common Errors & Fixes
+
+| Error | Cause | Fix |
+|---|---|---|
+| `Enhancement category needs to be maintained` | Missing `@AbapCatalog.enhancement.category` | Add `#NOT_EXTENSIBLE` as shown above |
+| `Table name too long` | Table name >16 characters | Shorten to ≤16 chars |
+| `Data element MATNR not found / obsolete` | Some S/4HANA releases renamed variants | Use `F2` in ADT on `matnr` to confirm the data element resolves in your system; if renamed, substitute the exact one shown |
+| `Field REQUEST_UUID: type RAW length 16 expected` | Wrong data element used for UUID | Must be `SYSUUID_X16`, not `SYSUUID` (22-char string) or `RAW(16)` directly |
+| Activation succeeds but Data Preview fails with authorization error | Missing `S_TABU_DIS` authorization in your test user | Request via Basis, or test via ADT which uses your dialog user's authorizations |
+
+---
+
+Step 1 is complete. Say **"Continue"** when you're ready for **Step 2 — Message Class**.
+
+Given the scope, I'll deliver Steps 2–12 in full now, keeping the same rigor as Step 1 but tightening the prose so the code stays complete and runnable. A few upfront design decisions I made (flagging per Rule 12, since your requirement doc leaves them open):
+
+1. **Status codes**: `N`=New, `V`=Validated, `A`=Approved, `R`=Rejected — used consistently everywhere.
+2. **"Validate Request"** is modeled as its own RAP **action** (not just a save-time check), because your business scenario lists it as a distinct user step, separate from the automatic field validations that guard data integrity on every save.
+3. **Number range for `REQUEST_NO`**: rather than introducing an SNRO object outside your fixed 12-step list, I generate it deterministically inside a determination (`SDR0000001`, `SDR0000002`, …). I call this out as a scale limitation below — acceptable for an assessment, not for high-concurrency production.
+4. Two actions beyond Approve — **Validate** and **Reject** — are added to the Behavior Definition since the business scenario explicitly requires them, even though the requirement doc's BDEF bullet list only named "Action Approve."
+
+---
+
+## STEP 2 — Message Class + Exception Class
+
+### Why we create it
+RAP validations/actions must never hardcode message text (Rule 15). The standard modern RAP pattern is: **Message Class** (SE91-style text repository, T100) + a **global exception class implementing `IF_T100_MESSAGE`** that RAP's `reported-<entity>` structure can consume via `%msg`. The exception class is the bridge between your message numbers and the RAP framework.
+
+### Where it is used
+Message Class → referenced only by the exception class. Exception class → instantiated inside every Validation and Action method in the Behavior Implementation (Step 8).
+
+### How RAP uses it
+When you append `%msg = NEW zcx_sdt_sample_msg( ... )` to `reported-<entity>`, RAP surfaces that message to the Fiori UI (as an inline error/warning on the field or object) and to the OData response. No manual `MESSAGE` statements are used anywhere in RAP handler methods.
+
+### Common mistakes
+- Forgetting `IF_ABAP_BEHV_MESSAGE` on the exception class → compiler error when assigning to `%msg`.
+- Using `MESSAGE ... INTO` classic syntax inside a behavior handler — not supported/appropriate in Managed RAP.
+- Message class message numbers not matching the constants used in the exception class — silent wrong-text bugs.
+
+### Activation order
+Must activate **before** the Utility Class and before the Behavior Implementation, since both will reference it. It has no dependency on the CDS/Table layer, so it *could* technically be built right after Step 1 — which is exactly why it's Step 2.
+
+---
+
+### Object Details
+
+| Item | Value |
+|---|---|
+| Object Type | Message Class |
+| Object Name | `ZSDT_SAMPLE_MSG` |
+| Package | `<MY_PACKAGE>` |
+| Transport | `<MY_TRANSPORT>` |
+
+### Message Class Content
+Create via **ADT → New → Other ABAP Repository Object → Message Class**. It opens a table-style editor — enter these rows:
+
+| No. | Message Text | Notes |
+|---|---|---|
+| 001 | Material &1 does not exist | `&1` = Material |
+| 002 | Material &1 is not extended to plant &2 | `&1`/`&2` = Material/Plant |
+| 003 | Customer &1 does not exist | `&1` = Customer |
+| 004 | Customer &1 is blocked for sample requests | `&1` = Customer |
+| 005 | Quantity must be greater than zero | — |
+| 006 | Quantity &1 exceeds the maximum allowed quantity &2 | `&1`/`&2` = Qty/Max Qty |
+| 007 | Request can only be approved when status is Validated | Approval Error |
+| 008 | Approved or already rejected requests cannot be rejected again | Reject Error |
+| 009 | Monthly sample cap exceeded for customer &1 | `&1` = Customer |
+
+Set **Self-Explanatory** = unchecked for each (so `&1`, `&2` placeholders are recognized). Save, activate.
+
+---
+
+### Object Details — Exception Class
+
+| Item | Value |
+|---|---|
+| Object Type | Global Class (Exception) |
+| Object Name | `ZCX_SDT_SAMPLE_MSG` |
+| Package | `<MY_PACKAGE>` |
+| Transport | `<MY_TRANSPORT>` |
+| Superclass | `CX_NO_CHECK` |
+
+```abap
+CLASS zcx_sdt_sample_msg DEFINITION
+  PUBLIC
+  INHERITING FROM cx_no_check
+  FINAL
+  CREATE PUBLIC .
+
+  PUBLIC SECTION.
+    INTERFACES if_t100_message.
+    INTERFACES if_abap_behv_message.
+
+    CONSTANTS:
+      BEGIN OF material_not_found,
+        msgid TYPE symsgid VALUE 'ZSDT_SAMPLE_MSG',
+        msgno TYPE symsgno VALUE '001',
+        attr1 TYPE scx_attrname VALUE 'MATERIAL',
+        attr2 TYPE scx_attrname VALUE '',
+        attr3 TYPE scx_attrname VALUE '',
+        attr4 TYPE scx_attrname VALUE '',
+      END OF material_not_found,
+
+      BEGIN OF material_not_extended,
+        msgid TYPE symsgid VALUE 'ZSDT_SAMPLE_MSG',
+        msgno TYPE symsgno VALUE '002',
+        attr1 TYPE scx_attrname VALUE 'MATERIAL',
+        attr2 TYPE scx_attrname VALUE 'PLANT',
+        attr3 TYPE scx_attrname VALUE '',
+        attr4 TYPE scx_attrname VALUE '',
+      END OF material_not_extended,
+
+      BEGIN OF customer_not_found,
+        msgid TYPE symsgid VALUE 'ZSDT_SAMPLE_MSG',
+        msgno TYPE symsgno VALUE '003',
+        attr1 TYPE scx_attrname VALUE 'CUSTOMER',
+        attr2 TYPE scx_attrname VALUE '',
+        attr3 TYPE scx_attrname VALUE '',
+        attr4 TYPE scx_attrname VALUE '',
+      END OF customer_not_found,
+
+      BEGIN OF customer_blocked,
+        msgid TYPE symsgid VALUE 'ZSDT_SAMPLE_MSG',
+        msgno TYPE symsgno VALUE '004',
+        attr1 TYPE scx_attrname VALUE 'CUSTOMER',
+        attr2 TYPE scx_attrname VALUE '',
+        attr3 TYPE scx_attrname VALUE '',
+        attr4 TYPE scx_attrname VALUE '',
+      END OF customer_blocked,
+
+      BEGIN OF quantity_invalid,
+        msgid TYPE symsgid VALUE 'ZSDT_SAMPLE_MSG',
+        msgno TYPE symsgno VALUE '005',
+        attr1 TYPE scx_attrname VALUE '',
+        attr2 TYPE scx_attrname VALUE '',
+        attr3 TYPE scx_attrname VALUE '',
+        attr4 TYPE scx_attrname VALUE '',
+      END OF quantity_invalid,
+
+      BEGIN OF quantity_exceeded,
+        msgid TYPE symsgid VALUE 'ZSDT_SAMPLE_MSG',
+        msgno TYPE symsgno VALUE '006',
+        attr1 TYPE scx_attrname VALUE 'QUANTITY',
+        attr2 TYPE scx_attrname VALUE 'MAX_QTY',
+        attr3 TYPE scx_attrname VALUE '',
+        attr4 TYPE scx_attrname VALUE '',
+      END OF quantity_exceeded,
+
+      BEGIN OF approval_error,
+        msgid TYPE symsgid VALUE 'ZSDT_SAMPLE_MSG',
+        msgno TYPE symsgno VALUE '007',
+        attr1 TYPE scx_attrname VALUE '',
+        attr2 TYPE scx_attrname VALUE '',
+        attr3 TYPE scx_attrname VALUE '',
+        attr4 TYPE scx_attrname VALUE '',
+      END OF approval_error,
+
+      BEGIN OF reject_error,
+        msgid TYPE symsgid VALUE 'ZSDT_SAMPLE_MSG',
+        msgno TYPE symsgno VALUE '008',
+        attr1 TYPE scx_attrname VALUE '',
+        attr2 TYPE scx_attrname VALUE '',
+        attr3 TYPE scx_attrname VALUE '',
+        attr4 TYPE scx_attrname VALUE '',
+      END OF reject_error,
+
+      BEGIN OF monthly_cap_exceeded,
+        msgid TYPE symsgid VALUE 'ZSDT_SAMPLE_MSG',
+        msgno TYPE symsgno VALUE '009',
+        attr1 TYPE scx_attrname VALUE 'CUSTOMER',
+        attr2 TYPE scx_attrname VALUE '',
+        attr3 TYPE scx_attrname VALUE '',
+        attr4 TYPE scx_attrname VALUE '',
+      END OF monthly_cap_exceeded .
+
+    DATA material TYPE matnr .
+    DATA plant    TYPE werks_d .
+    DATA customer TYPE kunnr .
+    DATA quantity TYPE string .
+    DATA max_qty  TYPE string .
+
+    METHODS constructor
+      IMPORTING
+        textid   LIKE if_t100_message=>t100key OPTIONAL
+        previous LIKE previous            OPTIONAL
+        material TYPE matnr               OPTIONAL
+        plant    TYPE werks_d             OPTIONAL
+        customer TYPE kunnr               OPTIONAL
+        quantity TYPE string              OPTIONAL
+        max_qty  TYPE string              OPTIONAL .
+ENDCLASS.
+
+
+CLASS zcx_sdt_sample_msg IMPLEMENTATION.
+
+  METHOD constructor.
+    super->constructor( previous = previous ).
+
+    me->material = material.
+    me->plant    = plant.
+    me->customer = customer.
+    me->quantity = quantity.
+    me->max_qty  = max_qty.
+
+    IF textid IS INITIAL.
+      if_t100_message~t100key = if_t100_message=>default_textid.
+    ELSE.
+      if_t100_message~t100key = textid.
+    ENDIF.
+  ENDMETHOD.
+
+ENDCLASS.
+```
+
+### Explanation
+- **`CX_NO_CHECK`** — chosen because RAP validation/action failures are *expected, handled* outcomes, not fatal programming errors; they must not force `TRY/CATCH` everywhere they're raised (unlike `CX_STATIC_CHECK`).
+- **`IF_T100_MESSAGE`** — standard interface that ties an exception instance to a T100 message class entry (`msgid`/`msgno`) plus up to 4 dynamic attributes (`attr1`–`attr4`) that map instance attributes (like `material`, `customer`) into the message placeholders `&1`, `&2` at display time.
+- **`IF_ABAP_BEHV_MESSAGE`** — a marker interface (no methods) required for the object to be assignable to `reported-<entity>-%msg` in RAP handler methods.
+- **`attr1`-style constants** — each `BEGIN OF ... END OF` structure names *which instance attribute* fills which placeholder, so `WITH material customer` style manual concatenation is never needed — Rule 15 satisfied.
+
+### Testing Steps
+1. Activate Message Class, then Exception Class.
+2. In a scratch program: `TRY. RAISE EXCEPTION NEW zcx_sdt_sample_msg( textid = zcx_sdt_sample_msg=>material_not_found material = 'TG-001' ). CATCH zcx_sdt_sample_msg INTO DATA(lx). cl_demo_output=>display( lx->get_text( ) ). ENDTRY.`
+3. Expected: displays "Material TG-001 does not exist".
+
+### Expected Output
+Message class shows 9 rows in SE91-style display; exception class activates with no syntax errors; `get_text( )` returns fully substituted text.
+
+### Common Errors & Fixes
+
+| Error | Cause | Fix |
+|---|---|---|
+| `Interface method not implemented` | Missing `IF_ABAP_BEHV_MESSAGE` | Add `INTERFACES if_abap_behv_message.` |
+| Message shows `&1` literally instead of value | `attr1` constant misspelled or doesn't match instance attribute name | Attribute name in `attr1` must exactly match the public instance attribute name (case-sensitive at the ABAP level, stored uppercase) |
+| `TEXTID` not resolving | Forgot to set `if_t100_message~t100key` in constructor | Confirm constructor code exactly as above |
+
+---
+
+## STEP 3 — Utility Class
+
+### Why we create it
+Centralizes reusable business rules (max quantity, status text, monthly cap check) so the Behavior Implementation and the ALV report both call the *same* logic instead of duplicating it (Rule 16, "never duplicate logic").
+
+### Where it is used
+- `GET_MAX_SAMPLE_QTY` → Behavior Implementation `validateQuantity`
+- `GET_STATUS_TEXT` → ALV Report (status column display) and optionally Fiori (if you later add a computed text field)
+- `IS_MONTHLY_CAP_HIT` → Behavior Implementation `Validate` action
+
+### How RAP uses it
+RAP itself doesn't call this class directly — it's a plain ABAP OO utility that the Behavior Implementation calls. This separation keeps the behavior handler thin and keeps business rules testable independently of RAP.
+
+### Common mistakes
+- Hardcoding `50` or `5` inline in the behavior class instead of referencing named constants here (Rule 17).
+- Making methods instance methods when they're stateless — should be `CLASS-METHODS`.
+- Computing "this month" using `sy-datum(6)` string slicing without validating date format — safer to build the month-start date explicitly (shown below).
+
+### Activation order
+Must activate **after** the Message Class (no dependency, but logically Step 3) and **before** the Behavior Implementation (Step 8), which is its only consumer besides the ALV report.
+
+---
+
+### Object Details
+
+| Item | Value |
+|---|---|
+| Object Type | Global Class |
+| Object Name | `ZCL_SDT_SAMPLE_UTIL` |
+| Package | `<MY_PACKAGE>` |
+| Transport | `<MY_TRANSPORT>` |
+
+```abap
+CLASS zcl_sdt_sample_util DEFINITION
+  PUBLIC
+  FINAL
+  CREATE PUBLIC .
+
+  PUBLIC SECTION.
+
+    CONSTANTS mc_status_new       TYPE c LENGTH 1 VALUE 'N'.
+    CONSTANTS mc_status_validated TYPE c LENGTH 1 VALUE 'V'.
+    CONSTANTS mc_status_approved  TYPE c LENGTH 1 VALUE 'A'.
+    CONSTANTS mc_status_rejected  TYPE c LENGTH 1 VALUE 'R'.
+
+    CONSTANTS mc_req_prefix     TYPE c LENGTH 3 VALUE 'SDR'.
+    CONSTANTS mc_req_no_digits  TYPE i VALUE 7.
+
+    CONSTANTS mc_max_sample_qty TYPE p LENGTH 8 DECIMALS 3 VALUE '50.000'.
+    CONSTANTS mc_monthly_cap    TYPE i VALUE 5.
+
+    CLASS-METHODS get_max_sample_qty
+      RETURNING VALUE(rv_max_qty) TYPE p LENGTH 8 DECIMALS 3.
+
+    CLASS-METHODS get_status_text
+      IMPORTING iv_status      TYPE c
+      RETURNING VALUE(rv_text) TYPE string.
+
+    CLASS-METHODS is_monthly_cap_hit
+      IMPORTING iv_customer   TYPE kunnr
+      RETURNING VALUE(rv_hit) TYPE abap_bool.
+
+ENDCLASS.
+
+
+CLASS zcl_sdt_sample_util IMPLEMENTATION.
+
+  METHOD get_max_sample_qty.
+    rv_max_qty = mc_max_sample_qty.
+  ENDMETHOD.
+
+
+  METHOD get_status_text.
+    CASE iv_status.
+      WHEN mc_status_new.
+        rv_text = 'New'.
+      WHEN mc_status_validated.
+        rv_text = 'Validated'.
+      WHEN mc_status_approved.
+        rv_text = 'Approved'.
+      WHEN mc_status_rejected.
+        rv_text = 'Rejected'.
+      WHEN OTHERS.
+        rv_text = 'Unknown'.
+    ENDCASE.
+  ENDMETHOD.
+
+
+  METHOD is_monthly_cap_hit.
+    DATA lv_count       TYPE i.
+    DATA lv_today       TYPE dats.
+    DATA lv_month_start TYPE dats.
+
+    lv_today = cl_abap_context_info=>get_system_date( ).
+    lv_month_start = lv_today.
+    lv_month_start+6(2) = '01'.
+
+    SELECT COUNT(*)
+      FROM zsdt_sample_req
+      WHERE customer   = @iv_customer
+        AND req_status <> @mc_status_rejected
+        AND req_date   >= @lv_month_start
+        AND req_date   <= @lv_today
+      INTO @lv_count.
+
+    rv_hit = xsdbool( lv_count >= mc_monthly_cap ).
+  ENDMETHOD.
+
+ENDCLASS.
+```
+
+### Method Explanations
+- **`GET_MAX_SAMPLE_QTY`** — returns the business-configured ceiling per sample request (50 units). Kept as a method (not a public constant reference directly) so that in a future phase this could read from a Customizing table without changing any caller's code — this is what "reusable" means in practice.
+- **`GET_STATUS_TEXT`** — single source of truth for status display text, used identically by the ALV report and available for any future CDS text-association replacement.
+- **`IS_MONTHLY_CAP_HIT`** — counts non-rejected requests for the customer from the 1st of the current month through today; returns `abap_true` if the count has already reached the cap (5). Uses `xsdbool()` instead of a manual `IF...THEN...ELSE` — Clean ABAP style.
+
+### Testing Steps
+1. Activate.
+2. Scratch test:
+```abap
+cl_demo_output=>display( zcl_sdt_sample_util=>get_status_text( 'A' ) ). " Approved
+cl_demo_output=>display( zcl_sdt_sample_util=>get_max_sample_qty( ) ). " 50.000
+cl_demo_output=>display( zcl_sdt_sample_util=>is_monthly_cap_hit( '0000100000' ) ).
+```
+
+### Expected Output
+Correct text/values returned; no dump even for a customer with zero requests (COUNT(*) safely returns 0).
+
+### Common Errors & Fixes
+
+| Error | Cause | Fix |
+|---|---|---|
+| `TYPE MISMATCH` on constant `mc_max_sample_qty` | Table field type used inconsistently | Keep utility class constants typed independently (`P LENGTH 8 DECIMALS 3`) rather than referencing the DDIC table type directly, to avoid a hard dependency loop |
+| `lv_month_start+6(2)` dump | `lv_today` not 8 characters (uninitialized) | Ensure `cl_abap_context_info=>get_system_date( )` call succeeds; wrap in `CX_ABAP_CONTEXT_INFO_ERROR` try/catch in production code |
+
+---
+
+## STEP 4 — CDS Root View Entity
+
+### Why we create it
+This is the **Behavior-Definition-eligible interface view** — it exposes the DB table's fields with business semantics (associations, text elements, criticality, admin annotations) that RAP, Fiori, and OData all consume. It is *not* consumed directly by the UI — that's the Projection View's job (Step 5).
+
+### Where it is used
+- Root of the Behavior Definition (Step 7)
+- Source for the Projection View (Step 5) via `as projection on`
+- Read by the ALV report is **not** required (ALV reads the table directly per your requirement, joining `MAKT`/`KNA1` in classic ABAP) — but the CDS view could be reused there too if you prefer central logic; I kept them separate to match your explicit ALV requirement (raw table + joins).
+
+### How RAP uses it
+Managed RAP derives its runtime CRUD implementation from this view's `select from` + key + associations. The `local_last_changed_at` field becomes the ETag master (declared in BDEF). Associations (`_Customer`, `_Product`, `_Plant`) become navigable in the Projection View and, from there, in Fiori Elements value helps/facets.
+
+### Common mistakes
+- Forgetting `@AccessControl.authorizationCheck: #CHECK` — leaves the view unprotected.
+- Assuming field names on `I_Customer`/`I_Product`/`I_Plant` without checking — I only used `CustomerName` from `I_Customer`, which is a confirmed standard field; I deliberately **did not** guess description fields off `I_Product`/`I_Plant` (Rule 11 — see note in code).
+- Missing `key` prefix on `RequestUUID` — the view won't activate as a root entity.
+- Putting UI annotations here instead of in the Metadata Extension — technically works but breaks separation of concerns and makes layered UI extension impossible later.
+
+### Activation order
+Must activate **after** Step 1 (table) — direct dependency via `select from`. Must activate **before** Step 5 (Projection View), which projects on top of it.
+
+---
+
+### Object Details
+
+| Item | Value |
+|---|---|
+| Object Type | CDS View (Root View Entity) — DDL Source |
+| Object Name | `ZI_SampleRequest` |
+| Package | `<MY_PACKAGE>` |
+| Transport | `<MY_TRANSPORT>` |
+
+```abap
+@AccessControl.authorizationCheck: #CHECK
+@EndUserText.label: 'Sample Request - Root View'
+@Metadata.allowExtensions: true
+@ObjectModel.semanticKey: ['RequestNo']
+@ObjectModel.representativeKey: 'RequestNo'
+@Search.searchable: true
+define root view entity ZI_SampleRequest
+  as select from zsdt_sample_req
+  association [0..1] to I_Customer as _Customer on  $projection.Customer = _Customer.Customer
+  association [0..1] to I_Product  as _Product  on  $projection.Material = _Product.Product
+  association [0..1] to I_Plant    as _Plant    on  $projection.Plant    = _Plant.Plant
+{
+      key request_uuid                                as RequestUUID,
+          request_no                                   as RequestNo,
+
+      @Search.defaultSearchElement: true
+      @ObjectModel.text.element: ['CustomerName']
+          customer                                     as Customer,
+
+      @Search.defaultSearchElement: true
+      // NOTE: Description text element intentionally omitted here.
+      // I_Product's description field name must be confirmed in your
+      // system (F2 / code completion in ADT) before adding
+      // @ObjectModel.text.element for Material - not assumed per
+      // project rule "never assume fields".
+          material                                     as Material,
+
+          plant                                         as Plant,
+
+      @Semantics.quantity.unitOfMeasure: 'Uom'
+          quantity                                      as Quantity,
+          uom                                            as Uom,
+
+          req_date                                       as ReqDate,
+          req_status                                      as ReqStatus,
+
+          // Computed criticality: drives status color in Fiori list/object page.
+          // 0 = Neutral (Grey) - New
+          // 1 = Negative (Red) - Rejected
+          // 2 = Critical (Yellow) - Validated
+          // 3 = Positive (Green) - Approved
+          case req_status
+            when 'A' then '3'
+            when 'R' then '1'
+            when 'V' then '2'
+            else '0'
+          end                                              as Criticality,
+
+          reject_reason                                     as RejectReason,
+          approved_by                                        as ApprovedBy,
+          approved_on                                         as ApprovedOn,
+
+      @Semantics.user.createdBy: true
+          created_by                                          as CreatedBy,
+
+      @Semantics.systemDateTime.createdAt: true
+          created_at                                           as CreatedAt,
+
+      @Semantics.user.lastChangedBy: true
+          last_changed_by                                       as LastChangedBy,
+
+      @Semantics.systemDateTime.lastChangedAt: true
+          last_changed_at                                        as LastChangedAt,
+
+      @Semantics.systemDateTime.localInstanceLastChangedAt: true
+          local_last_changed_at                                   as LocalLastChangedAt,
+
+          _Customer.CustomerName                                   as CustomerName,
+
+          /* Associations exposed for navigation & value helps */
+          _Customer,
+          _Product,
+          _Plant
+}
+```
+
+### Annotation Explanations
+- **`@AccessControl.authorizationCheck: #CHECK`** — mandates that an authorization check (DCL or behavior-level auth) is enforced before data is returned; `#NOT_REQUIRED` would silently disable this, which is unacceptable for a workflow with Approve/Reject.
+- **`@Metadata.allowExtensions: true`** — permits a Metadata Extension (Step 6) to attach UI annotations without modifying this view.
+- **`@ObjectModel.semanticKey: ['RequestNo']`** — tells Fiori/OData that `RequestNo`, not the technical UUID, is the field users identify a record by (search, deep links).
+- **`@ObjectModel.representativeKey`** — the single field shown when the app needs one label for the whole entity (e.g., message texts, breadcrumbs).
+- **`@Search.searchable` / `@Search.defaultSearchElement`** — enables the Fiori Elements search bar; `defaultSearchElement` marks which fields that free-text search actually scans (Customer, Material).
+- **`@Semantics.quantity.unitOfMeasure: 'Uom'`** — links `Quantity` to `Uom` so Fiori/ALV render "50.000 KG" correctly with proper decimal handling, instead of a bare number.
+- **`@ObjectModel.text.element: ['CustomerName']`** — tells consumers that `CustomerName` is the human-readable text for the `Customer` code field, enabling automatic "code + description" rendering in value helps.
+- **`@Semantics.user.createdBy` / `.systemDateTime.createdAt` / `.lastChangedBy` / `.lastChangedAt`** — these are what let RAP **auto-populate** these fields on Create/Update without any code in the Behavior Implementation.
+- **`@Semantics.systemDateTime.localInstanceLastChangedAt`** — marks the field eligible to be declared `etag master` in the Behavior Definition.
+- **`Criticality` computed column** — a `CASE` expression, not a persisted field; consumed later by `@UI.lineItem: [{ criticality: 'Criticality' }]` in the Metadata Extension for color-coded status.
+
+### Testing Steps
+1. Activate (requires Step 1 table already active).
+2. Data Preview → confirm all columns render, `Criticality` shows `0`/`1`/`2`/`3` correctly per test data's `req_status`.
+3. Hover over `Customer` column in Data Preview — description should resolve via association if test data exists in `I_Customer`.
+
+### Expected Output
+View activates clean; Data Preview shows computed `Criticality` and resolved `CustomerName`.
+
+### Common Errors & Fixes
+
+| Error | Cause | Fix |
+|---|---|---|
+| `Association target I_Customer not found` | Different SAP release naming or view not released for consumption | Confirm via ADT search (`Ctrl+Shift+A`) that `I_Customer` exists and is `@AbapCatalog.sqlViewName` released in your system |
+| `CASE expression: type mismatch` | Mixing `char1` literal with different implicit type | Ensure all `WHEN`/`THEN`/`ELSE` branches return the same length char literal (`'0'`,`'1'`,`'2'`,`'3'` — all 1 char) |
+| `Semantic key element does not exist in projection` (later, at BDEF stage) | Forgot to also expose `RequestNo` in projection | Confirmed included in Step 5 below |
+
+---
+
+## STEP 5 — Projection View (Consumption View)
+
+### Why we create it
+The Root View (Step 4) is the *interface* layer; the Projection View is the **consumption layer** exposed to Fiori/OData. Splitting these lets you later add a second projection (e.g., a "Manager Approval" app with fewer fields) without touching the root or the table.
+
+### Where it is used
+- Exposed in the Service Definition (Step 9)
+- Carries its own Behavior Definition (`use` variant) that delegates to the root BDEF
+- Carries the Metadata Extension (Step 6)
+
+### How RAP uses it
+`provider contract transactional_query` tells RAP this projection participates in the transactional (Create/Update/Delete/Action) contract, not just read-only reporting.
+
+### Common mistakes
+- Forgetting `provider contract transactional_query` — Fiori Elements draft/edit buttons won't appear correctly.
+- Not re-exposing associations needed for value helps in the UI.
+- Projecting fewer key fields than the root requires — breaks BDEF `use` mapping.
+
+### Activation order
+After Step 4 (depends on it via `projection on`), before Step 6 (Metadata Extension attaches to this object), before Step 7's projection-level Behavior Definition.
+
+---
+
+### Object Details
+
+| Item | Value |
+|---|---|
+| Object Type | CDS View (Projection View) — DDL Source |
+| Object Name | `ZC_SampleRequest` |
+| Package | `<MY_PACKAGE>` |
+| Transport | `<MY_TRANSPORT>` |
+
+```abap
+@AccessControl.authorizationCheck: #CHECK
+@EndUserText.label: 'Sample Request - Projection'
+@Metadata.allowExtensions: true
+@UI: { headerInfo: { typeName: 'Sample Request', typeNamePlural: 'Sample Requests' } }
+define root view entity ZC_SampleRequest
+  provider contract transactional_query
+  as projection on ZI_SampleRequest
+{
+      key RequestUUID,
+          RequestNo,
+          Customer,
+          Material,
+          Plant,
+          Quantity,
+          Uom,
+          ReqDate,
+          ReqStatus,
+          Criticality,
+          RejectReason,
+          ApprovedBy,
+          ApprovedOn,
+          CreatedBy,
+          CreatedAt,
+          LastChangedBy,
+          LastChangedAt,
+          LocalLastChangedAt,
+          CustomerName,
+
+          /* Associations for navigation / value help */
+          _Customer,
+          _Product,
+          _Plant
+}
+```
+
+### Explanation
+- **`provider contract transactional_query`** — a formal declaration (introduced for RAP projections) that this view supports the full transactional lifecycle (not just `#TRANSACTIONAL_INTERFACE` at root level) — required for Fiori Elements draft handling, action buttons, etc.
+- The minimal `@UI.headerInfo` here is intentionally light — the **complete** UI annotation set belongs in the Metadata Extension (Step 6), keeping this view annotation-light and easy to re-project later.
+- Every field the UI needs (including `Criticality` and `CustomerName`) must be explicitly listed — CDS projections don't auto-inherit unlisted fields.
+
+### Testing Steps
+1. Activate (needs Step 4 active).
+2. Data Preview should mirror the root view's output exactly (same row count/columns, minus any root fields you chose to omit — none omitted here).
+
+### Expected Output
+Clean activation; Data Preview identical to Step 4's.
+
+### Common Errors & Fixes
+
+| Error | Cause | Fix |
+|---|---|---|
+| `Key element RequestUUID missing` | Forgot `key` prefix in projection | Add `key` before `RequestUUID` |
+| Later BDEF error: `field not exposed in projection` | A field used by an action/validation in root BDEF isn't listed here | Add the missing field to the projection's field list |
+
+---
+
+## STEP 6 — Metadata Extension
+
+### Why we create it
+Separates **UI annotations** from the CDS view's business/data semantics — Clean ABAP separation of concerns, and it's the SAP-mandated way to add Fiori UI annotations to a projection view.
+
+### Where it is used
+Read by the Fiori Elements List Report + Object Page floorplan generated from the Service Binding (Step 10).
+
+### How RAP uses it
+RAP itself doesn't read this — Fiori Elements' metadata processor does, at OData `$metadata` request time, merging it with the projection view's own (minimal) annotations.
+
+### Common mistakes
+- Annotating fields not present in the projection view — activation error.
+- Forgetting `criticality` reference inside `@UI.lineItem`, resulting in status shown but not color-coded.
+- Placing this at `@Metadata.layer: #CUSTOMER` when it should be `#CORE` for your own custom app (both work for a fully custom object, but `#CUSTOMER` is reserved for extending SAP-delivered content — using `#CORE` is more correct here).
+
+### Activation order
+After Step 5 (target must exist).
+
+---
+
+### Object Details
+
+| Item | Value |
+|---|---|
+| Object Type | Metadata Extension |
+| Object Name | `ZC_SampleRequest` (same name as projection, different object type) |
+| Package | `<MY_PACKAGE>` |
+| Transport | `<MY_TRANSPORT>` |
+
+```abap
+@Metadata.layer: #CORE
+@UI: {
+  headerInfo: {
+    typeName: 'Sample Request',
+    typeNamePlural: 'Sample Requests',
+    title: { type: #STANDARD, value: 'RequestNo' },
+    description: { type: #STANDARD, value: 'Customer' }
+  }
+}
+
+annotate entity ZC_SampleRequest with
+{
+  @UI.facet: [
+    { id: 'GeneralInfo', type: #IDENTIFICATION_REFERENCE, label: 'General Information', position: 10 },
+    { id: 'StatusInfo',  type: #IDENTIFICATION_REFERENCE, label: 'Status',              position: 20 }
+  ]
+
+  @UI:  { selectionField: [{ position: 10 }],
+          lineItem:       [{ position: 10, importance: #HIGH }],
+          identification: [{ position: 10, label: 'Request No' }] }
+  RequestNo;
+
+  @UI:  { selectionField: [{ position: 20 }],
+          lineItem:       [{ position: 20 }],
+          identification: [{ position: 20, label: 'Customer' }] }
+  Customer;
+
+  @UI:  { lineItem:       [{ position: 25 }],
+          identification: [{ position: 25 }] }
+  CustomerName;
+
+  @UI:  { selectionField: [{ position: 30 }],
+          lineItem:       [{ position: 30 }],
+          identification: [{ position: 30, label: 'Material' }] }
+  Material;
+
+  @UI:  { lineItem:       [{ position: 40 }],
+          identification: [{ position: 40, label: 'Plant' }] }
+  Plant;
+
+  @UI:  { lineItem:       [{ position: 50 }],
+          identification: [{ position: 50, label: 'Quantity' }] }
+  Quantity;
+
+  @UI.hidden: true
+  Uom;
+
+  @UI:  { selectionField: [{ position: 40 }],
+          lineItem:       [{ position: 60 }],
+          identification: [{ position: 60, label: 'Request Date' }] }
+  ReqDate;
+
+  @UI:  { lineItem:       [{ position: 70, criticality: 'Criticality' }],
+          identification: [{ position: 70, label: 'Status' }] }
+  @Consumption.valueHelpDefinition: [{ entity: { name: 'I_StatusVH', element: 'Status' } }]
+  ReqStatus;
+
+  @UI.hidden: true
+  Criticality;
+
+  @UI:  { identification: [{ position: 80, label: 'Reject Reason' }] }
+  RejectReason;
+
+  @UI:  { identification: [{ position: 90, label: 'Approved By' }] }
+  ApprovedBy;
+
+  @UI:  { identification: [{ position: 100, label: 'Approved On' }] }
+  ApprovedOn;
+
+  @UI.hidden: true
+  CreatedBy;
+  @UI.hidden: true
+  CreatedAt;
+  @UI.hidden: true
+  LastChangedBy;
+  @UI.hidden: true
+  LastChangedAt;
+}
+```
+
+> **Note on `@Consumption.valueHelpDefinition` for `ReqStatus`**: this references a hypothetical `I_StatusVH` value-help entity which I have **not** built, since it wasn't in your 12-object list and I won't assume a standard SAP view exists for your custom single-character status codes (Rule 11). **Remove that line** if you don't build a custom value-help CDS view for status — the field will still work perfectly as a free-text/fixed-value field without it. I'm flagging this explicitly rather than silently guessing a nonexistent object.
+
+### Annotation Explanations
+- **`@UI.facet`** with `type: #IDENTIFICATION_REFERENCE` — creates the Object Page sections; each facet groups fields sharing the same `identification` position range conceptually (SAP groups by facet id, and identification-annotated fields render inside the facet matching their target).
+- **`@UI.lineItem`** — controls which fields (and in what order) appear as List Report table columns.
+- **`@UI.selectionField`** — controls which fields appear as filter bar inputs in the List Report.
+- **`@UI.identification`** — controls Object Page field group appearance/order.
+- **`criticality: 'Criticality'`** inside `lineItem` — this is what makes the status column render as a colored badge, referencing the computed 0–3 field from Step 4.
+- **`@UI.hidden: true`** — used for technical/admin fields (`Uom`, `Criticality`, audit fields) that shouldn't clutter the UI but must remain in the projection for internal logic (e.g., `Uom` still needed for the `Quantity` unit-of-measure rendering even though it's not its own visible column).
+
+### Testing Steps
+1. Activate (requires Step 5 active).
+2. Not independently testable in isolation — verified visually once the Service Binding (Step 10) is published and previewed.
+
+### Expected Output
+No activation errors; annotations validated against the projection's field list.
+
+### Common Errors & Fixes
+
+| Error | Cause | Fix |
+|---|---|---|
+| `Element X does not exist in ZC_SampleRequest` | Typo, or field not exposed in projection | Cross-check field name spelling against Step 5's field list |
+| Status column shows text but no color | `criticality` reference missing or misspelled inside `lineItem` | Confirm exact syntax `{ position: 70, criticality: 'Criticality' }` |
+| `Value help entity I_StatusVH not found` | Left the optional value-help annotation in without building it | Delete that `@Consumption.valueHelpDefinition` block (see note above) |
+
+---
+
+## STEP 7 — Behavior Definition (Root + Projection)
+
+### Why we create it
+This is where RAP's declarative CRUD+ contract lives: lock behavior, authorization strategy, ETag, field control (readonly/mandatory), determinations, validations, and actions are all *declared* here; Step 8 supplies the *logic*.
+
+### Where it is used
+Compiled by the RAP runtime into the actual OData CRUD/action handling; consumed by the Behavior Implementation class, which must match every determination/validation/action signature declared here exactly.
+
+### How RAP uses it
+`strict ( 2 )` enforces RAP's strongest correctness checks at both compile- and run-time (e.g., disallows unmanaged direct table access from handler methods, enforces `%control` usage, blocks non-deterministic determinations). `managed` tells RAP to auto-generate the Create/Update/Delete SADL/CDS persistence calls — you only supply business logic in determinations/validations/actions, never manual `INSERT`/`UPDATE` SQL.
+
+### Common mistakes
+- Declaring `lock master`/`authorization master` on the **projection** BDEF instead of the **root** BDEF — must be on root.
+- Forgetting `etag master` — every Update/Action call will fail optimistic-concurrency checks or (worse) silently skip them.
+- Marking calculated fields (like `Criticality`) in a `field (readonly)` clause — calculated fields aren't part of the transactional structure and don't belong there.
+- Missing `use` statements in the projection BDEF for actions — the action won't be exposed to OData at all even though the root BDEF has it.
+
+### Activation order
+Root BDEF activates **after** Step 4 (CDS root view) and **after** the exception class (Step 2) is available for message references used inside — though message references are actually in Step 8, not here; the BDEF itself only needs Step 4 + the abstract entity below. The projection BDEF activates after Step 5 **and** after the root BDEF.
+
+### Supporting object needed here: Reject Reason Parameter
+
+The `Reject` action needs to accept a free-text reason. RAP action parameters must be typed against a CDS **abstract entity**:
+
+```abap
+@EndUserText.label: 'Reject Reason Parameter'
+define abstract entity ZI_SampleRejectReason
+{
+  @EndUserText.label: 'Reject Reason'
+  RejectReason : abap.char( 100 );
+}
+```
+*(Object type: DDL Source — Abstract Entity; same package/transport as everything else. Activate before the root BDEF.)*
+
+---
+
+### Object Details — Root Behavior Definition
+
+| Item | Value |
+|---|---|
+| Object Type | Behavior Definition |
+| Object Name | `ZI_SampleRequest` |
+| Package | `<MY_PACKAGE>` |
+| Transport | `<MY_TRANSPORT>` |
+| Implementation Class | `ZBP_I_SAMPLEREQUEST` (created automatically by ADT quick-fix) |
+
+```abap
+managed implementation in class zbp_i_samplerequest unique;
+strict ( 2 );
+
+define behavior for ZI_SampleRequest alias SampleRequest
+persistent table zsdt_sample_req
+lock master
+authorization master ( instance )
+etag master LocalLastChangedAt
+{
+  create;
+  update ( features : instance );
+  delete ( features : instance );
+
+  field ( readonly )   RequestUUID, RequestNo, ReqStatus,
+                        RejectReason, ApprovedBy, ApprovedOn,
+                        CreatedBy, CreatedAt, LastChangedBy,
+                        LastChangedAt, LocalLastChangedAt;
+
+  field ( mandatory )  Customer, Material, Plant, Quantity, ReqDate;
+
+  action ( features : instance ) Validate result [1] $self;
+  action ( features : instance ) Approve  result [1] $self;
+  action ( features : instance ) Reject   parameter ZI_SampleRejectReason result [1] $self;
+
+  determination setInitialValues on modify { create; }
+  determination deriveUOM        on modify { field Material; }
+
+  validation validateMaterial on save { create; field Material; }
+  validation validateCustomer on save { create; field Customer; }
+  validation validateQuantity on save { create; field Quantity; }
+
+  mapping for zsdt_sample_req
+  {
+    RequestUUID         = request_uuid;
+    RequestNo            = request_no;
+    Customer             = customer;
+    Material             = material;
+    Plant                = plant;
+    Quantity             = quantity;
+    Uom                  = uom;
+    ReqDate              = req_date;
+    ReqStatus            = req_status;
+    RejectReason         = reject_reason;
+    ApprovedBy           = approved_by;
+    ApprovedOn           = approved_on;
+    CreatedBy            = created_by;
+    CreatedAt            = created_at;
+    LastChangedBy        = last_changed_by;
+    LastChangedAt        = last_changed_at;
+    LocalLastChangedAt   = local_last_changed_at;
+  }
+}
+```
+
+### Object Details — Projection Behavior Definition
+
+| Item | Value |
+|---|---|
+| Object Type | Behavior Definition |
+| Object Name | `ZC_SampleRequest` |
+| Package | `<MY_PACKAGE>` |
+| Transport | `<MY_TRANSPORT>` |
+
+```abap
+projection;
+strict ( 2 );
+
+define behavior for ZC_SampleRequest alias SampleRequest
+{
+  use create;
+  use update;
+  use delete;
+
+  use action Validate;
+  use action Approve;
+  use action Reject;
+
+  use association _Customer;
+  use association _Product;
+  use association _Plant;
+}
+```
+
+### Concept Explanations
+- **`strict ( 2 )`** — the strictest RAP compliance level; catches issues like using `%control` incorrectly, non-exclusive lock declarations, or calling non-RAP-approved statements inside handler methods, *at design time* instead of at runtime.
+- **`lock master`** — this entity owns its own optimistic/pessimistic lock (via the standard RAP lock enqueue mechanism); since there's no parent/child composition here, the root is trivially also the lock master.
+- **`authorization master ( instance )`** — every instance-level operation (Create/Update/Delete/Action) triggers an authorization check via `AUTHORITY-CHECK` inside a dedicated check method you'd implement in `get_instance_authorizations` (optional; if omitted, RAP defaults to allow — for the assessment I've kept this declarative-only and noted below that a production build would add an explicit instance-authorization method using a custom object like `ZSDT_APPR`, created via SU21, checked against `ACTVT` values 01/02/06 and custom activities for Approve/Reject).
+- **`etag master LocalLastChangedAt`** — every Update/Action request must supply the ETag it last read; a mismatch → HTTP 412, protecting against two approvers processing stale data.
+- **`field ( readonly )`** — these fields can never be set by an OData PATCH from the UI; they're only ever set by RAP itself (admin fields) or by our own determinations/actions (RequestNo, ReqStatus, ApprovedBy/On, RejectReason).
+- **`field ( mandatory )`** — Fiori Elements will block Save until these are filled; this is UI-level enforcement, distinct from (and in addition to) the save-time *content* validations in Step 8.
+- **`action ... result [1] $self`** — each action returns exactly one instance of the same entity (`$self`), which lets the UI immediately refresh the row's new status without a separate GET round-trip.
+- **`determination ... on modify { create; }`** — triggers automatically and synchronously right after a Create is registered (before Save), used here to stamp default values.
+- **`determination ... on modify { field Material; }`** — triggers whenever `Material` changes (on Create or Update), used to auto-derive `Uom`.
+- **`validation ... on save { create; field Material; }`** — triggers at Save time, for new instances, when `Material` was touched — keeps validation cost minimal (doesn't re-validate untouched fields).
+- **`mapping for zsdt_sample_req`** — explicit CDS-alias-to-DB-column mapping; required because our CDS field names (`RequestUUID`) differ in casing/style from the DB column names (`request_uuid`).
+- **Projection BDEF `use` statements** — nothing here has its own logic; it purely re-exposes the root's capabilities to the projection layer that the Service Definition will publish.
+
+### Testing Steps
+1. Activate the abstract entity first, then the root BDEF, then the projection BDEF.
+2. Check the **Problems** view in ADT — should show zero errors/warnings for `strict(2)` compliance.
+3. Use **ADT → Behavior Definition → "Generate Behavior Implementation"** quick-fix — this auto-creates the `ZBP_I_SAMPLEREQUEST` class skeleton with correctly-typed method signatures (do this before Step 8 so you paste logic into the generated stubs rather than typing signatures by hand).
+
+### Expected Output
+Both BDEFs activate clean; the quick-fix generates an empty `LHC_SAMPLEREQUEST` local handler class with method stubs matching every determination/validation/action declared above.
+
+### Common Errors & Fixes
+
+| Error | Cause | Fix |
+|---|---|---|
+| `Persistent table field REQUEST_NO used in mapping but not readonly-consistent` | Mismatch between mandatory/readonly declarations and mapping | Ensure `RequestNo` stays in `field(readonly)`, never `mandatory` |
+| `Action parameter type ZI_SampleRejectReason not found` | Abstract entity not activated first | Activate `ZI_SampleRejectReason` before the BDEF |
+| `strict(2): field control conflicts with determination` | A field is both `readonly` and targeted by a determination that's fine — but if also listed `mandatory`, conflict | Never list the same field in both `readonly` and `mandatory` |
+| Projection BDEF: `action Validate not found in root` | Root BDEF not activated/saved before editing projection | Activate root BDEF first, then re-open projection BDEF editor |
+
+---
+
+## STEP 8 — Behavior Implementation
+
+### Why we create it
+Supplies the actual ABAP logic for every determination, validation, and action declared in Step 7. This is where the Utility Class and Exception Class get wired together — the only place custom business logic executes in this whole BO.
+
+### Where it is used
+Invoked automatically by the RAP runtime at the exact lifecycle points named in the BDEF (`on modify`, `on save`, action call) — you never call these methods directly.
+
+### How RAP uses it
+The generated local class `lhc_SampleRequest` inherits from `cl_abap_behavior_handler`. RAP instantiates it per request, calls the matching method with a `keys` table (or `keys FOR ACTION ...`), and reads back `result`/`mapped`/`failed`/`reported` after each call.
+
+### Common mistakes
+- Calling `MODIFY ENTITIES` without `IN LOCAL MODE` — required within Managed RAP handler methods operating on the same BO.
+- Forgetting to populate `reported-samplerequest` even for successful instances (needed so the framework doesn't treat the message channel as stale) — I do this only where relevant (validations); actions only report on failure.
+- Re-implementing the monthly-cap SELECT inline instead of calling `zcl_sdt_sample_util=>is_monthly_cap_hit` — direct rule violation of "never duplicate logic."
+- Not restricting `Approve`/`Reject`/`Validate` to only fire from the correct source status — without `get_instance_features`, the UI would show all three buttons active regardless of state, and users could double-approve.
+
+### Activation order
+Last object dependent on Steps 1–7 — must activate **after all of them**, and specifically after the BDEF quick-fix has generated the class stub (Step 7's last testing step).
+
+---
+
+### Object Details
+
+| Item | Value |
+|---|---|
+| Object Type | Class (Behavior Pool) |
+| Object Name | `ZBP_I_SAMPLEREQUEST` |
+| Package | `<MY_PACKAGE>` |
+| Transport | `<MY_TRANSPORT>` |
+
+```abap
+CLASS lhc_SampleRequest DEFINITION INHERITING FROM cl_abap_behavior_handler.
+
+  PRIVATE SECTION.
+
+    METHODS get_instance_features FOR INSTANCE FEATURES
+      IMPORTING keys REQUEST requested_features FOR SampleRequest RESULT result.
+
+    METHODS setInitialValues FOR DETERMINE ON MODIFY
+      IMPORTING keys FOR SampleRequest~setInitialValues.
+
+    METHODS deriveUOM FOR DETERMINE ON MODIFY
+      IMPORTING keys FOR SampleRequest~deriveUOM.
+
+    METHODS validateMaterial FOR VALIDATE ON SAVE
+      IMPORTING keys FOR SampleRequest~validateMaterial.
+
+    METHODS validateCustomer FOR VALIDATE ON SAVE
+      IMPORTING keys FOR SampleRequest~validateCustomer.
+
+    METHODS validateQuantity FOR VALIDATE ON SAVE
+      IMPORTING keys FOR SampleRequest~validateQuantity.
+
+    METHODS Validate FOR MODIFY
+      IMPORTING keys FOR ACTION SampleRequest~Validate RESULT result.
+
+    METHODS Approve FOR MODIFY
+      IMPORTING keys FOR ACTION SampleRequest~Approve RESULT result.
+
+    METHODS Reject FOR MODIFY
+      IMPORTING keys FOR ACTION SampleRequest~Reject RESULT result.
+
+ENDCLASS.
+
+
+CLASS lhc_SampleRequest IMPLEMENTATION.
+
+  METHOD get_instance_features.
+    READ ENTITIES OF ZI_SampleRequest IN LOCAL MODE
+      ENTITY SampleRequest
+        FIELDS ( ReqStatus )
+        WITH CORRESPONDING #( keys )
+      RESULT DATA(lt_requests).
+
+    result = VALUE #( FOR ls_request IN lt_requests
+      ( %tky = ls_request-%tky
+
+        %features-%action-Validate =
+          COND #( WHEN ls_request-ReqStatus = zcl_sdt_sample_util=>mc_status_new
+                  THEN if_abap_behv=>fc-o-enabled ELSE if_abap_behv=>fc-o-disabled )
+
+        %features-%action-Approve =
+          COND #( WHEN ls_request-ReqStatus = zcl_sdt_sample_util=>mc_status_validated
+                  THEN if_abap_behv=>fc-o-enabled ELSE if_abap_behv=>fc-o-disabled )
+
+        %features-%action-Reject =
+          COND #( WHEN ls_request-ReqStatus = zcl_sdt_sample_util=>mc_status_new
+                       OR ls_request-ReqStatus = zcl_sdt_sample_util=>mc_status_validated
+                  THEN if_abap_behv=>fc-o-enabled ELSE if_abap_behv=>fc-o-disabled )
+
+        %features-%update =
+          COND #( WHEN ls_request-ReqStatus = zcl_sdt_sample_util=>mc_status_new
+                  THEN if_abap_behv=>fc-o-enabled ELSE if_abap_behv=>fc-o-disabled )
+
+        %features-%delete =
+          COND #( WHEN ls_request-ReqStatus = zcl_sdt_sample_util=>mc_status_new
+                  THEN if_abap_behv=>fc-o-enabled ELSE if_abap_behv=>fc-o-disabled )
+      ) ).
+  ENDMETHOD.
+
+
+  METHOD setInitialValues.
+    DATA lt_update TYPE TABLE FOR UPDATE ZI_SampleRequest.
+
+    SELECT SINGLE MAX( request_no ) FROM zsdt_sample_req INTO @DATA(lv_max_char).
+
+    DATA(lv_counter) = COND i( WHEN lv_max_char IS NOT INITIAL
+                                THEN lv_max_char+3(7)
+                                ELSE 0 ).
+
+    LOOP AT keys INTO DATA(ls_key).
+      lv_counter += 1.
+
+      APPEND VALUE #(
+        %tky                = ls_key-%tky
+        RequestNo           = |{ zcl_sdt_sample_util=>mc_req_prefix }{ lv_counter WIDTH = 7 ALIGN = RIGHT PAD = '0' }|
+        %control-RequestNo  = if_abap_behv=>mk-on
+        ReqStatus           = zcl_sdt_sample_util=>mc_status_new
+        %control-ReqStatus  = if_abap_behv=>mk-on
+        ReqDate             = cl_abap_context_info=>get_system_date( )
+        %control-ReqDate    = if_abap_behv=>mk-on
+      ) TO lt_update.
+    ENDLOOP.
+
+    MODIFY ENTITIES OF ZI_SampleRequest IN LOCAL MODE
+      ENTITY SampleRequest
+        UPDATE FIELDS ( RequestNo ReqStatus ReqDate )
+        WITH lt_update.
+  ENDMETHOD.
+
+
+  METHOD deriveUOM.
+    READ ENTITIES OF ZI_SampleRequest IN LOCAL MODE
+      ENTITY SampleRequest
+        FIELDS ( Material Uom )
+        WITH CORRESPONDING #( keys )
+      RESULT DATA(lt_requests).
+
+    DATA lt_update TYPE TABLE FOR UPDATE ZI_SampleRequest.
+
+    LOOP AT lt_requests INTO DATA(ls_request)
+         WHERE Uom IS INITIAL AND Material IS NOT INITIAL.
+
+      SELECT SINGLE base_unit
+        FROM I_Product
+        WHERE product = @ls_request-Material
+        INTO @DATA(lv_base_unit).
+
+      IF sy-subrc = 0.
+        APPEND VALUE #(
+          %tky             = ls_request-%tky
+          Uom              = lv_base_unit
+          %control-Uom     = if_abap_behv=>mk-on
+        ) TO lt_update.
+      ENDIF.
+    ENDLOOP.
+
+    IF lt_update IS NOT INITIAL.
+      MODIFY ENTITIES OF ZI_SampleRequest IN LOCAL MODE
+        ENTITY SampleRequest
+          UPDATE FIELDS ( Uom )
+          WITH lt_update.
+    ENDIF.
+  ENDMETHOD.
+
+
+  METHOD validateMaterial.
+    READ ENTITIES OF ZI_SampleRequest IN LOCAL MODE
+      ENTITY SampleRequest
+        FIELDS ( Material Plant )
+        WITH CORRESPONDING #( keys )
+      RESULT DATA(lt_requests).
+
+    LOOP AT lt_requests INTO DATA(ls_request).
+      APPEND VALUE #( %tky = ls_request-%tky ) TO reported-samplerequest.
+
+      IF ls_request-Material IS INITIAL.
+        CONTINUE.
+      ENDIF.
+
+      SELECT SINGLE product FROM I_Product
+        WHERE product = @ls_request-Material
+        INTO @DATA(lv_product).
+
+      IF sy-subrc <> 0.
+        APPEND VALUE #( %tky = ls_request-%tky ) TO failed-samplerequest.
+        APPEND VALUE #( %tky = ls_request-%tky
+                         %msg = NEW zcx_sdt_sample_msg(
+                                    textid   = zcx_sdt_sample_msg=>material_not_found
+                                    material = ls_request-Material ) )
+               TO reported-samplerequest.
+        CONTINUE.
+      ENDIF.
+
+      IF ls_request-Plant IS NOT INITIAL.
+        SELECT SINGLE product FROM I_ProductPlantBasic
+          WHERE product = @ls_request-Material
+            AND plant   = @ls_request-Plant
+          INTO @DATA(lv_product_plant).
+
+        IF sy-subrc <> 0.
+          APPEND VALUE #( %tky = ls_request-%tky ) TO failed-samplerequest.
+          APPEND VALUE #( %tky = ls_request-%tky
+                           %msg = NEW zcx_sdt_sample_msg(
+                                      textid   = zcx_sdt_sample_msg=>material_not_extended
+                                      material = ls_request-Material
+                                      plant    = ls_request-Plant ) )
+                 TO reported-samplerequest.
+        ENDIF.
+      ENDIF.
+    ENDLOOP.
+  ENDMETHOD.
+
+
+  METHOD validateCustomer.
+    READ ENTITIES OF ZI_SampleRequest IN LOCAL MODE
+      ENTITY SampleRequest
+        FIELDS ( Customer )
+        WITH CORRESPONDING #( keys )
+      RESULT DATA(lt_requests).
+
+    LOOP AT lt_requests INTO DATA(ls_request).
+      APPEND VALUE #( %tky = ls_request-%tky ) TO reported-samplerequest.
+
+      IF ls_request-Customer IS INITIAL.
+        CONTINUE.
+      ENDIF.
+
+      SELECT SINGLE kunnr, sperr FROM kna1
+        WHERE kunnr = @ls_request-Customer
+        INTO @DATA(ls_kna1).
+
+      IF sy-subrc <> 0.
+        APPEND VALUE #( %tky = ls_request-%tky ) TO failed-samplerequest.
+        APPEND VALUE #( %tky = ls_request-%tky
+                         %msg = NEW zcx_sdt_sample_msg(
+                                    textid   = zcx_sdt_sample_msg=>customer_not_found
+                                    customer = ls_request-Customer ) )
+               TO reported-samplerequest.
+        CONTINUE.
+      ENDIF.
+
+      IF ls_kna1-sperr = abap_true.
+        APPEND VALUE #( %tky = ls_request-%tky ) TO failed-samplerequest.
+        APPEND VALUE #( %tky = ls_request-%tky
+                         %msg = NEW zcx_sdt_sample_msg(
+                                    textid   = zcx_sdt_sample_msg=>customer_blocked
+                                    customer = ls_request-Customer ) )
+               TO reported-samplerequest.
+      ENDIF.
+    ENDLOOP.
+  ENDMETHOD.
+
+
+  METHOD validateQuantity.
+    READ ENTITIES OF ZI_SampleRequest IN LOCAL MODE
+      ENTITY SampleRequest
+        FIELDS ( Quantity )
+        WITH CORRESPONDING #( keys )
+      RESULT DATA(lt_requests).
+
+    DATA(lv_max_qty) = zcl_sdt_sample_util=>get_max_sample_qty( ).
+
+    LOOP AT lt_requests INTO DATA(ls_request).
+      APPEND VALUE #( %tky = ls_request-%tky ) TO reported-samplerequest.
+
+      IF ls_request-Quantity <= 0.
+        APPEND VALUE #( %tky = ls_request-%tky ) TO failed-samplerequest.
+        APPEND VALUE #( %tky = ls_request-%tky
+                         %msg = NEW zcx_sdt_sample_msg( textid = zcx_sdt_sample_msg=>quantity_invalid ) )
+               TO reported-samplerequest.
+        CONTINUE.
+      ENDIF.
+
+      IF ls_request-Quantity > lv_max_qty.
+        APPEND VALUE #( %tky = ls_request-%tky ) TO failed-samplerequest.
+        APPEND VALUE #( %tky = ls_request-%tky
+                         %msg = NEW zcx_sdt_sample_msg(
+                                    textid   = zcx_sdt_sample_msg=>quantity_exceeded
+                                    quantity = |{ ls_request-Quantity }|
+                                    max_qty  = |{ lv_max_qty }| ) )
+               TO reported-samplerequest.
+      ENDIF.
+    ENDLOOP.
+  ENDMETHOD.
+
+
+  METHOD Validate.
+    READ ENTITIES OF ZI_SampleRequest IN LOCAL MODE
+      ENTITY SampleRequest
+        FIELDS ( Customer )
+        WITH CORRESPONDING #( keys )
+      RESULT DATA(lt_requests).
+
+    DATA lt_update TYPE TABLE FOR UPDATE ZI_SampleRequest.
+
+    LOOP AT lt_requests INTO DATA(ls_request).
+      IF zcl_sdt_sample_util=>is_monthly_cap_hit( ls_request-Customer ).
+        APPEND VALUE #( %tky = ls_request-%tky ) TO failed-samplerequest.
+        APPEND VALUE #( %tky = ls_request-%tky
+                         %msg = NEW zcx_sdt_sample_msg(
+                                    textid   = zcx_sdt_sample_msg=>monthly_cap_exceeded
+                                    customer = ls_request-Customer ) )
+               TO reported-samplerequest.
+        CONTINUE.
+      ENDIF.
+
+      APPEND VALUE #(
+        %tky                = ls_request-%tky
+        ReqStatus           = zcl_sdt_sample_util=>mc_status_validated
+        %control-ReqStatus  = if_abap_behv=>mk-on
+      ) TO lt_update.
+    ENDLOOP.
+
+    IF lt_update IS NOT INITIAL.
+      MODIFY ENTITIES OF ZI_SampleRequest IN LOCAL MODE
+        ENTITY SampleRequest
+          UPDATE FIELDS ( ReqStatus )
+          WITH lt_update
+        FAILED failed
+        REPORTED reported.
+    ENDIF.
+
+    READ ENTITIES OF ZI_SampleRequest IN LOCAL MODE
+      ENTITY SampleRequest
+        ALL FIELDS WITH CORRESPONDING #( keys )
+      RESULT DATA(lt_result).
+
+    result = VALUE #( FOR ls_result IN lt_result
+                       ( %tky = ls_result-%tky %param = ls_result ) ).
+  ENDMETHOD.
+
+
+  METHOD Approve.
+    READ ENTITIES OF ZI_SampleRequest IN LOCAL MODE
+      ENTITY SampleRequest
+        FIELDS ( ReqStatus )
+        WITH CORRESPONDING #( keys )
+      RESULT DATA(lt_requests).
+
+    DATA lt_update TYPE TABLE FOR UPDATE ZI_SampleRequest.
+
+    LOOP AT lt_requests INTO DATA(ls_request).
+      IF ls_request-ReqStatus <> zcl_sdt_sample_util=>mc_status_validated.
+        APPEND VALUE #( %tky = ls_request-%tky ) TO failed-samplerequest.
+        APPEND VALUE #( %tky = ls_request-%tky
+                         %msg = NEW zcx_sdt_sample_msg( textid = zcx_sdt_sample_msg=>approval_error ) )
+               TO reported-samplerequest.
+        CONTINUE.
+      ENDIF.
+
+      APPEND VALUE #(
+        %tky                  = ls_request-%tky
+        ReqStatus             = zcl_sdt_sample_util=>mc_status_approved
+        %control-ReqStatus    = if_abap_behv=>mk-on
+        ApprovedBy            = cl_abap_context_info=>get_user_technical_name( )
+        %control-ApprovedBy   = if_abap_behv=>mk-on
+        ApprovedOn            = cl_abap_context_info=>get_system_date( )
+        %control-ApprovedOn   = if_abap_behv=>mk-on
+      ) TO lt_update.
+    ENDLOOP.
+
+    IF lt_update IS NOT INITIAL.
+      MODIFY ENTITIES OF ZI_SampleRequest IN LOCAL MODE
+        ENTITY SampleRequest
+          UPDATE FIELDS ( ReqStatus ApprovedBy ApprovedOn )
+          WITH lt_update
+        FAILED failed
+        REPORTED reported.
+    ENDIF.
+
+    READ ENTITIES OF ZI_SampleRequest IN LOCAL MODE
+      ENTITY SampleRequest
+        ALL FIELDS WITH CORRESPONDING #( keys )
+      RESULT DATA(lt_result).
+
+    result = VALUE #( FOR ls_result IN lt_result
+                       ( %tky = ls_result-%tky %param = ls_result ) ).
+  ENDMETHOD.
+
+
+  METHOD Reject.
+    READ ENTITIES OF ZI_SampleRequest IN LOCAL MODE
+      ENTITY SampleRequest
+        FIELDS ( ReqStatus )
+        WITH CORRESPONDING #( keys )
+      RESULT DATA(lt_requests).
+
+    DATA lt_update TYPE TABLE FOR UPDATE ZI_SampleRequest.
+
+    LOOP AT keys INTO DATA(ls_key).
+      READ TABLE lt_requests INTO DATA(ls_request) WITH KEY %tky = ls_key-%tky.
+      IF sy-subrc <> 0.
+        CONTINUE.
+      ENDIF.
+
+      IF ls_request-ReqStatus = zcl_sdt_sample_util=>mc_status_approved
+      OR ls_request-ReqStatus = zcl_sdt_sample_util=>mc_status_rejected.
+        APPEND VALUE #( %tky = ls_key-%tky ) TO failed-samplerequest.
+        APPEND VALUE #( %tky = ls_key-%tky
+                         %msg = NEW zcx_sdt_sample_msg( textid = zcx_sdt_sample_msg=>reject_error ) )
+               TO reported-samplerequest.
+        CONTINUE.
+      ENDIF.
+
+      APPEND VALUE #(
+        %tky                    = ls_key-%tky
+        ReqStatus               = zcl_sdt_sample_util=>mc_status_rejected
+        %control-ReqStatus      = if_abap_behv=>mk-on
+        RejectReason            = ls_key-%param-RejectReason
+        %control-RejectReason   = if_abap_behv=>mk-on
+      ) TO lt_update.
+    ENDLOOP.
+
+    IF lt_update IS NOT INITIAL.
+      MODIFY ENTITIES OF ZI_SampleRequest IN LOCAL MODE
+        ENTITY SampleRequest
+          UPDATE FIELDS ( ReqStatus RejectReason )
+          WITH lt_update
+        FAILED failed
+        REPORTED reported.
+    ENDIF.
+
+    READ ENTITIES OF ZI_SampleRequest IN LOCAL MODE
+      ENTITY SampleRequest
+        ALL FIELDS WITH CORRESPONDING #( keys )
+      RESULT DATA(lt_result).
+
+    result = VALUE #( FOR ls_result IN lt_result
+                       ( %tky = ls_result-%tky %param = ls_result ) ).
+  ENDMETHOD.
+
+ENDCLASS.
+```
+
+### Concept Explanations
+- **`READ ENTITIES ... IN LOCAL MODE`** — the RAP-approved way to re-read instance data inside a handler; "local mode" means it reads the in-transaction buffer (including not-yet-saved changes), not a fresh DB round-trip.
+- **`%tky`** — the framework-generated technical key structure component (wraps the semantic/technical key fields) used to correlate `keys`, `failed`, `reported`, and `mapped` entries back to the same instance.
+- **`%control-<field> = if_abap_behv=>mk-on`** — mandatory whenever you set a field value via `MODIFY ENTITIES`; without it, RAP ignores the value (treats it as "field not touched").
+- **`FAILED` / `REPORTED`** — standard RAP output parameters: `FAILED` marks which instances didn't process; `REPORTED` carries the actual messages (built from our exception class) shown to the user.
+- **Action's own `RESULT`** — every action must return the updated instance(s) via `%param`, which is what lets Fiori Elements refresh the row's status/color immediately after Approve/Reject/Validate without a page reload.
+- **Utility Class reuse** — note `zcl_sdt_sample_util=>mc_status_*` constants and `is_monthly_cap_hit`/`get_max_sample_qty` calls are used everywhere status logic or limits are checked — never duplicated as raw literals or repeated SELECTs.
+
+### Testing Steps (via ADT's built-in RAP Business Object test tool)
+1. Right-click `ZC_SampleRequest` behavior definition → **Run As → Business Object Test Class** (or use the service binding preview once Step 10 is built — recommended for full end-to-end testing).
+2. Create a new instance with a known invalid material → expect `validateMaterial` to block save with message 001.
+3. Create a valid instance → Save → confirm `RequestNo` auto-generated as `SDR0000001`, `ReqStatus` = `N`.
+4. Call `Validate` action → confirm status becomes `V` (or blocked with message 009 if you've created 5+ requests this month for that customer).
+5. Call `Approve` on a `V` record → confirm status becomes `A`, `ApprovedBy`/`ApprovedOn` populated.
+6. Try `Approve` again → expect message 007 (Approval Error), since status is now `A` not `V`.
+7. Call `Reject` on an `N` record with a reason → confirm status becomes `R`, `RejectReason` stored.
+
+### Expected Output
+All scenarios behave exactly as above; class activates with zero syntax errors once all Step 1–7 objects are active.
+
+### Common Errors & Fixes
+
+| Error | Cause | Fix |
+|---|---|---|
+| `Field REQUEST_NO cannot be changed, it is read-only` | Trying to set `RequestNo` from outside `setInitialValues` | Only the determination may write it — confirm no other code path touches it |
+| `Exception CX_SY_ITAB_LINE_NOT_FOUND` in Reject | `READ TABLE ... WITH KEY %tky` fails silently caught, but if removed causes dump | Keep the `IF sy-subrc <> 0. CONTINUE. ENDIF.` guard |
+| Monthly cap never triggers | Test data's `req_date` outside current month, or all prior requests have `req_status = 'R'` (excluded by design) | Confirm test data dates fall within the current calendar month |
+| `TYPE_CONFLICT` when calling `get_max_sample_qty` in `validateQuantity` | Mismatched quan type precision between behavior structure and utility method return | Utility method returns `p length 8 decimals 3`, matching table's `quan(13,3)` at value-level; ensure no truncation warning ignored |
+
+---
+
+## STEP 9 — Service Definition
+
+### Why we create it
+Declares *which* CDS projection(s) are exposed as an OData service — the bridge between your RAP BO and the outside world (Fiori, Postman, any OData consumer).
+
+### Where it is used
+Consumed exclusively by the Service Binding (Step 10).
+
+### How RAP uses it
+Purely declarative — no runtime logic. One Service Definition can expose multiple projections (e.g., if you later add a "Sample Request Approval Worklist" projection), all published together under one OData service via a single Service Binding.
+
+### Common mistakes
+- Exposing the **root** view (`ZI_SampleRequest`) instead of the **projection** (`ZC_SampleRequest`) — root views are for reuse by other CDS/BDEFs, not direct UI exposure.
+- Choosing an entity set name that clashes with another already-published service in your system.
+
+### Activation order
+After Step 6 (Metadata Extension) and Step 7 (both BDEFs) are active — though technically only the projection view (Step 5) is a hard dependency, best practice is to only build the Service Definition once the full BO (including behavior) is complete.
+
+---
+
+### Object Details
+
+| Item | Value |
+|---|---|
+| Object Type | Service Definition |
+| Object Name | `ZSD_SAMPLE_REQUEST` |
+| Package | `<MY_PACKAGE>` |
+| Transport | `<MY_TRANSPORT>` |
+
+```abap
+@EndUserText.label: 'Service Definition - Material Sample Dispatch Tracker'
+define service definition ZSD_SAMPLE_REQUEST {
+  expose ZC_SampleRequest as SampleRequest;
+}
+```
+
+### Explanation
+- **`expose ... as SampleRequest`** — `SampleRequest` becomes the OData **entity set name** clients see in the service (`/SampleRequest`), independent of the technical CDS view name — lets you rename the underlying view later without breaking API consumers.
+
+### Testing Steps
+1. Activate.
+2. In ADT, right-click the Service Definition → **Preview** — this does an ad-hoc, unpublished test render (separate from the formal Service Binding preview in Step 11).
+
+### Expected Output
+Activates with no errors; ADT's built-in preview (if used) shows a basic list of sample requests.
+
+### Common Errors & Fixes
+
+| Error | Cause | Fix |
+|---|---|---|
+| `CDS view ZC_SampleRequest cannot be exposed - not transactional_query` | Forgot `provider contract transactional_query` in Step 5 | Re-check Step 5's projection view header |
+| `Entity set name already in use` | Another service definition in the system already uses `SampleRequest` | Rename the alias, e.g. `as SampleRequestSet` |
+
+---
+
+## STEP 10 — Service Binding
+
+### How to create
+1. In ADT, right-click the package (or the Service Definition itself) → **New → Service Binding**.
+2. **Name**: `ZSB_SAMPLE_REQUEST`; **Description**: "Material Sample Dispatch Tracker – UI Binding".
+3. **Binding Type**: `ODATA V4 - UI` (this is what enables Fiori Elements draft/action buttons; `ODATA V2 - UI` is the alternative if your Fiori launchpad still requires V2 — for a fresh S/4HANA 2022 Managed RAP build, V4 is the modern and expected choice).
+4. **Service Definition**: select `ZSD_SAMPLE_REQUEST` (from Step 9).
+5. Click **Finish** — this generates the binding but does **not yet activate/publish it**.
+
+### How to publish
+1. Open the generated Service Binding editor.
+2. Click **Publish** (top toolbar, or the "Local Service Endpoint" tab → Publish button).
+3. ADT registers the service in `/IWFND/MAINT_SERVICE` (backend) and assigns a runtime endpoint — you'll see the status change to "Published, Active".
+4. If publishing fails, check that your BC user has authorization for `S_SERVICE`/`SICF` maintenance, and that ICF node activation succeeded (visible in SICF under `/sap/opu/odata4/...`).
+
+### How to preview
+1. In the same Service Binding editor, select the entity set `SampleRequest` from the list.
+2. Click **Preview** — this launches a browser-based generic Fiori Elements List Report/Object Page rendering directly from your metadata (no separate Fiori app project needed for testing).
+3. Confirm:
+   - List Report shows filter bar fields (RequestNo, Customer, Material, ReqDate) per Step 6's `selectionField` annotations.
+   - Table columns match `lineItem` annotations, with `ReqStatus` colored per criticality.
+   - Clicking a row opens the Object Page with the two facets (General Information, Status).
+   - "Create" opens a draft with mandatory-field enforcement (Customer, Material, Plant, Quantity, ReqDate).
+   - After Save, the **Validate**, **Approve**, **Reject** action buttons appear/disappear correctly based on `ReqStatus` (this exercises `get_instance_features` from Step 8).
+
+### Common Errors & Fixes
+
+| Error | Cause | Fix |
+|---|---|---|
+| Preview shows blank/404 | Service not published, or ICF node inactive | Re-run Publish; check SICF |
+| Action buttons never enabled | `get_instance_features` logic inverted, or `use action X;` missing from projection BDEF | Re-check Step 7's projection BDEF `use action` list and Step 8's feature logic |
+| "Draft lost" error on save | Underlying validation failing silently (e.g., material check throwing an unhandled dump instead of a RAP message) | Check the exception class attributes are correctly populated; test the create flow with valid test data first to isolate |
+
+---
+
+## STEP 11 — Fiori Preview
+
+Already covered functionally in Step 10's "How to preview" — that preview **is** the Fiori Elements Preview requested here (RAP doesn't require a separate manually-coded Fiori app for a Managed BO; the List Report/Object Page floorplan is entirely metadata-driven). If your assessment specifically requires a **saved SAP Business Application Studio / Fiori Launchpad tile** (rather than the ad-hoc ADT preview), that's a separate BAS-based app creation step outside ABAP/ADT scope — let me know if your assessment requires that and I'll walk through the BAS "Fiori Generator" flow for wrapping this OData V4 service into a launchpad-deployable app.
+
+---
+
+## STEP 12 — Classic ALV Report
+
+### Why we create it
+Your requirement explicitly asks for a **Classic ALV** display alongside the Fiori UI — this report reads the same table directly (bypassing RAP, since ALV is a reporting/read-only tool, not a transactional client) and joins in descriptive texts from `MAKT` and `KNA1`.
+
+### Where it is used
+Run standalone via SE38/SA38 or a transaction code, typically for backend/power-user reporting where Fiori isn't needed.
+
+### How RAP uses it
+It doesn't — this is intentionally classic ABAP, reading `ZSDT_SAMPLE_REQ` directly via Open SQL. RAP governs writes; plain reporting reads are outside RAP's contract.
+
+### Common mistakes
+- Reading via the CDS projection instead of the table when the requirement explicitly asks for table + `MAKT`/`KNA1` joins.
+- Forgetting `LEFT JOIN` (using `INNER JOIN` would silently drop rows whose material/customer master data doesn't exist — makes debugging orphaned data harder).
+- Hardcoding color values instead of deriving them via the Utility Class's status constants.
+
+### Activation order
+Independent of the RAP BO chain (only depends on Step 1's table) — but logically last, since it's a secondary consumption channel built once the core data model is stable.
+
+---
+
+### Object Details
+
+| Item | Value |
+|---|---|
+| Object Type | Executable Program (Report) |
+| Object Name | `ZSDT_SAMPLE_REQ_ALV` |
+| Package | `<MY_PACKAGE>` |
+| Transport | `<MY_TRANSPORT>` |
+
+```abap
+REPORT zsdt_sample_req_alv.
+
+TABLES: zsdt_sample_req.
+
+SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE TEXT-001.
+SELECT-OPTIONS: s_kunnr FOR zsdt_sample_req-customer,
+                s_matnr FOR zsdt_sample_req-material,
+                s_rdate FOR zsdt_sample_req-req_date.
+PARAMETERS:     p_status TYPE zsdt_sample_req-req_status AS LISTBOX VISIBLE LENGTH 20.
+PARAMETERS:     p_open   TYPE abap_bool AS CHECKBOX DEFAULT abap_false.
+SELECTION-SCREEN END OF BLOCK b1.
+
+TYPES: BEGIN OF ty_display,
+         request_uuid   TYPE zsdt_sample_req-request_uuid,
+         request_no     TYPE zsdt_sample_req-request_no,
+         customer       TYPE zsdt_sample_req-customer,
+         name1          TYPE kna1-name1,
+         material       TYPE zsdt_sample_req-material,
+         maktx          TYPE makt-maktx,
+         plant          TYPE zsdt_sample_req-plant,
+         quantity       TYPE zsdt_sample_req-quantity,
+         uom            TYPE zsdt_sample_req-uom,
+         req_date       TYPE zsdt_sample_req-req_date,
+         req_status     TYPE zsdt_sample_req-req_status,
+         status_text    TYPE string,
+         reject_reason  TYPE zsdt_sample_req-reject_reason,
+         approved_by    TYPE zsdt_sample_req-approved_by,
+         approved_on    TYPE zsdt_sample_req-approved_on,
+         cellcolor      TYPE lvc_t_scol,
+       END OF ty_display.
+
+DATA: gt_display TYPE STANDARD TABLE OF ty_display,
+      go_table   TYPE REF TO cl_salv_table.
+
+CLASS lcl_handler DEFINITION.
+  PUBLIC SECTION.
+    METHODS on_link_click FOR EVENT link_click OF cl_salv_events_table
+      IMPORTING row column.
+ENDCLASS.
+
+CLASS lcl_handler IMPLEMENTATION.
+  METHOD on_link_click.
+    READ TABLE gt_display INTO DATA(ls_row) INDEX row.
+    IF sy-subrc = 0.
+      MESSAGE i001(00) WITH 'Request' ls_row-request_no
+                             'Status:' ls_row-status_text.
+    ENDIF.
+  ENDMETHOD.
+ENDCLASS.
+
+INITIALIZATION.
+  DATA: lt_list TYPE vrm_values,
+        ls_list LIKE LINE OF lt_list.
+
+  ls_list-key = ''.
+  ls_list-text = 'All Statuses'.
+  APPEND ls_list TO lt_list.
+  ls_list-key = zcl_sdt_sample_util=>mc_status_new.
+  ls_list-text = 'New'.
+  APPEND ls_list TO lt_list.
+  ls_list-key = zcl_sdt_sample_util=>mc_status_validated.
+  ls_list-text = 'Validated'.
+  APPEND ls_list TO lt_list.
+  ls_list-key = zcl_sdt_sample_util=>mc_status_approved.
+  ls_list-text = 'Approved'.
+  APPEND ls_list TO lt_list.
+  ls_list-key = zcl_sdt_sample_util=>mc_status_rejected.
+  ls_list-text = 'Rejected'.
+  APPEND ls_list TO lt_list.
+
+  CALL FUNCTION 'VRM_SET_VALUES'
+    EXPORTING
+      id     = 'P_STATUS'
+      values = lt_list.
+
+START-OF-SELECTION.
+  PERFORM read_data.
+  PERFORM display_alv.
+
+FORM read_data.
+  DATA: lr_status TYPE RANGE OF zsdt_sample_req-req_status.
+
+  IF p_status IS NOT INITIAL.
+    lr_status = VALUE #( ( sign = 'I' option = 'EQ' low = p_status ) ).
+  ENDIF.
+
+  IF p_open = abap_true.
+    lr_status = VALUE #( BASE lr_status
+      ( sign = 'E' option = 'EQ' low = zcl_sdt_sample_util=>mc_status_approved )
+      ( sign = 'E' option = 'EQ' low = zcl_sdt_sample_util=>mc_status_rejected ) ).
+  ENDIF.
+
+  SELECT a~request_uuid, a~request_no, a~customer, c~name1,
+         a~material, b~maktx, a~plant, a~quantity, a~uom,
+         a~req_date, a~req_status, a~reject_reason,
+         a~approved_by, a~approved_on
+    FROM zsdt_sample_req AS a
+    LEFT JOIN makt AS b
+      ON b~matnr = a~material AND b~spras = @sy-langu
+    LEFT JOIN kna1 AS c
+      ON c~kunnr = a~customer
+    WHERE a~customer   IN @s_kunnr
+      AND a~material   IN @s_matnr
+      AND a~req_date   IN @s_rdate
+      AND a~req_status IN @lr_status
+    INTO CORRESPONDING FIELDS OF TABLE @gt_display.
+
+  LOOP AT gt_display ASSIGNING FIELD-SYMBOL(<ls_display>).
+    <ls_display>-status_text = zcl_sdt_sample_util=>get_status_text( <ls_display>-req_status ).
+
+    DATA(lv_color) = SWITCH lvc_col( <ls_display>-req_status
+      WHEN zcl_sdt_sample_util=>mc_status_approved  THEN cl_gui_resources=>list_color_positive
+      WHEN zcl_sdt_sample_util=>mc_status_rejected  THEN cl_gui_resources=>list_color_negative
+      WHEN zcl_sdt_sample_util=>mc_status_validated THEN cl_gui_resources=>list_color_important
+      ELSE cl_gui_resources=>list_color_total ).
+
+    APPEND VALUE #( fname = 'REQ_STATUS' color-col = lv_color color-int = 0 color-inv = 0 )
+      TO <ls_display>-cellcolor.
+  ENDLOOP.
+ENDFORM.
+
+FORM display_alv.
+  TRY.
+      cl_salv_table=>factory(
+        IMPORTING r_salv_table = go_table
+        CHANGING  t_table      = gt_display ).
+    CATCH cx_salv_msg.
+      MESSAGE 'ALV could not be created' TYPE 'S' DISPLAY LIKE 'E'.
+      RETURN.
+  ENDTRY.
+
+  go_table->get_functions( )->set_all( abap_true ).
+
+  DATA(lo_columns) = go_table->get_columns( ).
+  lo_columns->set_color_column( 'CELLCOLOR' ).
+  lo_columns->get_column( 'REQUEST_UUID' )->set_visible( abap_false ).
+  lo_columns->get_column( 'CELLCOLOR' )->set_technical( abap_true ).
+
+  TRY.
+      lo_columns->get_column( 'REQUEST_NO' )->set_short_text( 'Req. No' ).
+      lo_columns->get_column( 'NAME1' )->set_short_text( 'Customer Name' ).
+      lo_columns->get_column( 'MAKTX' )->set_short_text( 'Material Desc' ).
+      lo_columns->get_column( 'STATUS_TEXT' )->set_short_text( 'Status' ).
+      CAST cl_salv_column_table( lo_columns->get_column( 'REQUEST_NO' )
+        )->set_cell_type( if_salv_c_cell_type=>hotspot ).
+    CATCH cx_salv_not_found.
+  ENDTRY.
+
+  DATA(lo_sorts) = go_table->get_sorts( ).
+  TRY.
+      lo_sorts->add_sort( 'CUSTOMER' ).
+      lo_sorts->add_sort( 'REQ_STATUS' ).
+    CATCH cx_salv_existing cx_salv_data_error cx_salv_not_found.
+  ENDTRY.
+
+  DATA(lo_aggregations) = go_table->get_aggregations( ).
+  TRY.
+      lo_aggregations->add_aggregation( 'QUANTITY' ).
+    CATCH cx_salv_existing cx_salv_data_error cx_salv_not_found.
+  ENDTRY.
+
+  DATA(lo_display) = go_table->get_display_settings( ).
+  lo_display->set_list_header( 'Material Sample Dispatch Requests' ).
+  lo_display->set_striped_pattern( abap_true ).
+
+  DATA(lo_events) = go_table->get_event( ).
+  DATA(lo_handler) = NEW lcl_handler( ).
+  SET HANDLER lo_handler->on_link_click FOR lo_events.
+
+  go_table->display( ).
+ENDFORM.
+```
+
+*(`TEXT-001` selection-screen block title: create via **Text Elements → Selection Texts** in the program properties, e.g. "Selection Criteria".)*
+
+### Explanations
+- **Range table (`lr_status`) built from Include + Exclude entries** — lets one field (`p_status`) plus one checkbox (`p_open`) drive filtering without writing branching dynamic-WHERE SQL; if `p_status` is blank and `p_open` is checked, the Exclude-only range correctly returns "everything except Approved/Rejected."
+- **`LEFT JOIN`** on `MAKT`/`KNA1` — guarantees sample requests still display even if a material/customer master record was since archived or has a data issue, rather than silently vanishing from the report (which `INNER JOIN` would cause).
+- **`CL_SALV_TABLE` + `set_color_column`** — the standard classic-ALV mechanism for per-cell coloring: each row's internal table carries its own `LVC_T_SCOL` structure naming which field (`REQ_STATUS`) gets which color, populated once during data read using the **same** status constants from the Utility Class — no duplicated status-to-color logic.
+- **Hotspot on `REQUEST_NO`** — `set_cell_type( if_salv_c_cell_type=>hotspot )` turns the column into a clickable link; `SET HANDLER ... FOR lo_events` wires the click to `on_link_click`, which shows a quick popup — demonstrating interactivity as required.
+- **Sorting + Subtotal** — `add_sort` groups rows by Customer then Status; `add_aggregation( 'QUANTITY' )` produces subtotal rows automatically at each sort-group break.
+
+### Testing Steps
+1. Activate the report.
+2. Run via SE38/ADT "Run As → ABAP Application".
+3. Leave selection screen blank, execute — should list all requests, sorted/subtotaled by customer, with color-coded status.
+4. Filter by a specific customer and "Only Open Requests" checked — confirms Approved/Rejected rows excluded.
+5. Click a `Req. No` hotspot — confirms popup shows the status text.
+
+### Expected Output
+ALV grid renders with striped rows, colored status column (green/red/yellow/grey), quantity subtotals per customer/status group, and functioning hotspot.
+
+### Common Errors & Fixes
+
+| Error | Cause | Fix |
+|---|---|---|
+| `Field REQ_STATUS not found for color column` | `CELLCOLOR` structure's `fname` value doesn't exactly match the internal table's field name casing | Field names in `LVC_T_SCOL-FNAME` are case-insensitive but must match spelling exactly — confirmed `'REQ_STATUS'` above |
+| No colors shown at all | Forgot `lo_columns->set_color_column( 'CELLCOLOR' )` | Confirm this line is present before `go_table->display( )` |
+| `cx_salv_not_found` on `get_column( 'REQUEST_NO' )` | Field name mismatch (ALV auto-generates column names from itab field names in uppercase) | Match exactly the structure component name, uppercase |
+| Subtotal not appearing | Sort field for the aggregated group wasn't added via `add_sort` before `add_aggregation` | Ensure `CUSTOMER`/`REQ_STATUS` sorts are added first |
+
+---
+
+## Summary — Build Complete
+
+All 12 objects (plus the two small supporting objects — the exception class and the abstract entity, both required by RAP and your own message-class/action requirements) are now specified end-to-end, in dependency order:
+
+1. `ZSDT_SAMPLE_REQ` (table)
+2. `ZSDT_SAMPLE_MSG` + `ZCX_SDT_SAMPLE_MSG` (message class + exception class)
+3. `ZCL_SDT_SAMPLE_UTIL` (utility class)
+4. `ZI_SampleRequest` (root CDS view)
+5. `ZC_SampleRequest` (projection view)
+6. `ZC_SampleRequest` metadata extension
+7. `ZI_SampleRejectReason` (abstract entity) + `ZI_SampleRequest`/`ZC_SampleRequest` behavior definitions
+8. `ZBP_I_SAMPLEREQUEST` (behavior implementation)
+9. `ZSD_SAMPLE_REQUEST` (service definition)
+10. `ZSB_SAMPLE_REQUEST` (service binding)
+11. Fiori preview (via Step 10's binding)
+12. `ZSDT_SAMPLE_REQ_ALV` (classic ALV report)
+
+**Before you submit**: replace every `<MY_PACKAGE>` / `<MY_TRANSPORT>` placeholder, and double-check the two fields I flagged rather than assumed (`I_Product`'s description-text field name for Step 4, and whether you want the optional `I_StatusVH` value-help reference removed from Step 6). Let me know if you'd like me to also build the instance-level authorization object (`ZSDT_APPR` via SU21) referenced in Step 7's explanation, or the BAS Fiori Launchpad tile wrapper mentioned in Step 11 — both are natural next additions but sit outside your original 12-object list.
